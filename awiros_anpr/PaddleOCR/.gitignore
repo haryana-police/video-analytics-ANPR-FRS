@@ -1,0 +1,29 @@
+# Skip the nested PaddleOCR .git history and big doc dirs that got vendored in.
+# Only the runtime-needed `ppocr/` package + small configs are actually imported.
+.git/
+.github/
+doc/
+docs/
+test_tipc/
+tests/
+benchmark/
+applications/
+deploy/
+configs/
+langchain-paddleocr/
+paddleocr-js/
+api_sdk/
+ppstructure/
+tools/
+readme/
+*.md
+*.png
+*.jpg
+*.gif
+*.ttf
+*.ttc
+awesome_projects.md
+CNAME
+*.yaml
+*.yml
+*.toml
