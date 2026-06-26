@@ -48,13 +48,10 @@ ch_PP-OCRv4_det_server_infer/
 ch_PP-OCRv4_rec_server_infer/
 
 # Awiros ANPR model (large safetensors)
-awiros_anpr/
 
 # Trained model weights (large, regeneratable)
-*.pt
 *.pth
 *.onnx
-*.safetensors
 
 # Local datasets and runs
 plate_dataset/
