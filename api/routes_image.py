@@ -12,7 +12,6 @@ image_bp = Blueprint("image", __name__)
 
 HERE = Path(__file__).resolve().parent.parent
 YOLO_MODEL = HERE / "yolo11_plate.pt"
-REPORT_PATH = HERE / "test" / "New folder" / "images" / "yolo11_awiros_ocr_run" / "report.html"
 UPLOAD_DIR = HERE / "uploads"
 RESULTS_DIR = HERE / "results"
 
@@ -32,18 +31,11 @@ def _save_result_image(stem: str, img_bgr) -> str:
     cv2.imwrite(str(RESULTS_DIR / fname), img_bgr, [cv2.IMWRITE_JPEG_QUALITY, 88])
     return f"/results/{fname}"
 
-def _save_crop_image(stem: str, img_bgr) -> str:
-    import cv2
-    fname = f"{stem}_crop_{int(time.time() * 1000)}.jpg"
-    cv2.imwrite(str(RESULTS_DIR / fname), img_bgr, [cv2.IMWRITE_JPEG_QUALITY, 90])
-    return f"/results/{fname}"
-
 @image_bp.get("/")
 def index():
     return render_template(
         "index.html",
         yolo_model=YOLO_MODEL.name,
-        report_url=str(REPORT_PATH) if REPORT_PATH.exists() else "",
     )
 
 @image_bp.post("/api/predict")
@@ -54,11 +46,18 @@ def api_predict():
         f = request.files["file"]
         if not f.filename:
             return jsonify(error="Empty filename."), 400
+        
+        model_coco = request.form.get("model_coco", "yolo11s")
+        model_plate = request.form.get("model_plate", "yolo11_plate")
+        conf = float(request.form.get("conf", 0.25))
+
         path = _save_upload(f)
         try:
             img = _read_image(path)
             t0 = time.time()
-            out = engine.predict(img, conf=float(request.form.get("conf", 0.25)))
+            out = engine.predict(
+                img, conf=conf, model_coco_name=model_coco, model_plate_name=model_plate
+            )
             out["total_ms"] = round((time.time() - t0) * 1000, 1)
             out["filename"] = f.filename
             out["timestamp"] = datetime.now().isoformat(timespec="seconds")
@@ -78,36 +77,30 @@ def api_detect():
             return jsonify(error="No image uploaded. Send a file in the 'image' field."), 400
 
         conf = float(request.form.get("conf", 0.25))
+        model_coco = request.form.get("model_coco", "yolo11s")
+        model_plate = request.form.get("model_plate", "yolo11_plate")
+        
         stem = Path(f.filename).stem
         path = _save_upload(f)
         try:
             img = _read_image(path)
             t0 = time.time()
-            out = engine.predict(img, conf=conf)
+            out = engine.predict(
+                img, conf=conf, model_coco_name=model_coco, model_plate_name=model_plate
+            )
             elapsed = round(time.time() - t0, 2)
 
-            plates = []
-            for i, det in enumerate(out["detections"], 1):
-                ocr = det["ocr"]
-                text = ocr.get("text", "") or ""
-                ocr_conf = ocr.get("confidence", 0.0)
-                valid_format = bool(ocr.get("readable")) and len(text) >= 4
-                x1, y1, x2, y2 = det["bbox_xyxy"]
-                H, W = img.shape[:2]
-                x1c, y1c = max(0, x1), max(0, y1)
-                x2c, y2c = min(W, x2), min(H, y2)
-                crop_bgr = img[y1c:y2c, x1c:x2c]
-                crop_url = _save_crop_image(f"{stem}_{i}", crop_bgr) if crop_bgr.size else ""
-                plates.append({
-                    "text": text if text else None,
-                    "valid_format": valid_format,
-                    "detection_confidence": det["confidence"],
-                    "ocr_confidence": ocr_conf,
-                    "state_code": "",
-                    "format_type": "standard",
-                    "crop_url": crop_url,
-                    "bbox_xyxy": det["bbox_xyxy"],
-                    "raw_ocr": text,
+            # Map plates to the flat format for retro-compatibility if needed
+            plates_payload = []
+            for p in out["plates"]:
+                plates_payload.append({
+                    "text": p["text"],
+                    "valid_format": p["readable"],
+                    "detection_confidence": p["confidence"],
+                    "ocr_confidence": p["ocr_confidence"],
+                    "crop_url": p["crop_url"],
+                    "bbox_xyxy": p["bbox_xyxy"],
+                    "raw_ocr": p["text"],
                     "fixes_applied": [],
                     "engine": "Awiros ANPR-OCR",
                 })
@@ -117,18 +110,21 @@ def api_detect():
                 "filename": f.filename,
                 "timestamp": datetime.now().isoformat(timespec="seconds"),
                 "size": out["size"],
-                "num_plates": len(plates),
-                "num_valid": sum(1 for p in plates if p["valid_format"]),
-                "num_vehicles": 0,
-                "vehicle_counts": {},
-                "vehicles": [],
-                "elapsed_seconds": elapsed,
-                "inference_ms_yolo": out["inference_ms_yolo"],
-                "inference_ms_ocr_total": out["inference_ms_ocr_total"],
-                "plates": plates,
+                "num_plates": out["num_plates"],
+                "num_valid": sum(1 for p in plates_payload if p["valid_format"]),
+                "num_vehicles": out["num_vehicles"],
+                "num_persons": out["num_persons"],
+                "vehicles": out["vehicles"],
+                "persons": out["persons"],
+                "plates": plates_payload,
                 "annotated_url": annotated_url,
+                "elapsed_seconds": elapsed,
+                "inference_ms_yolo_coco": out["inference_ms_yolo_coco"],
+                "inference_ms_yolo_plate": out["inference_ms_yolo_plate"],
+                "inference_ms_ocr_total": out["inference_ms_ocr_total"],
                 "engine": {
-                    "detector": "YOLO11 (yolo11_plate.pt)",
+                    "detector_coco": f"YOLO11 ({model_coco})",
+                    "detector_plate": f"YOLO11 ({model_plate})",
                     "ocr": "Awiros ANPR-OCR (PP-OCRv5 SVTR_HGNet / CTC)",
                     "device": "cpu",
                 },
@@ -149,17 +145,18 @@ def serve_result(filename):
 def health():
     return jsonify(
         status="ok",
-        yolo_loaded=engine.yolo is not None,
+        yolo_loaded=len(engine.yolo_models) > 0,
         awiros_loaded=engine.awiros is not None,
-        report_exists=REPORT_PATH.exists(),
     )
 
-@image_bp.get("/report")
-def report():
-    if REPORT_PATH.exists():
-        return redirect(f"/static-report/report.html", code=302)
-    return jsonify(error="Report not built yet. Run build_report.py first."), 404
 
-@image_bp.get("/static-report/<path:filename>")
-def static_report(filename):
-    return send_from_directory(REPORT_PATH.parent, filename)
+@image_bp.get("/health/full")
+def health_full():
+    """Health endpoint used by the live-dashboard to surface what the
+    pipeline has cached. Includes per-model readiness flags."""
+    return jsonify(
+        status="ok",
+        yolo_loaded=len(engine.yolo_models) > 0,
+        awiros_loaded=engine.awiros is not None,
+        cached_models=sorted(engine.yolo_models.keys()),
+    )

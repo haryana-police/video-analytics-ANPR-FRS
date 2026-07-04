@@ -1,6 +1,5 @@
 # Auto detect text files and perform LF normalization
 * text=auto
-
 # Git LFS: large model weights are stored as LFS pointers, not in the repo directly.
 # Install git-lfs locally and run `git lfs pull` after cloning to fetch the actual files.
 *.pt filter=lfs diff=lfs merge=lfs -text

@@ -9,8 +9,6 @@ from flask import Blueprint, jsonify, request, send_from_directory
 video_bp = Blueprint("video", __name__)
 
 HERE = Path(__file__).resolve().parent.parent
-YOLO_MODEL = HERE / "yolo11_plate.pt"
-AWIROS_DIR = HERE / "awiros_anpr"
 VIDEOS_DIR = HERE / "uploads_videos"
 VIDEO_RESULTS_DIR = HERE / "video_results"
 
@@ -29,6 +27,10 @@ def api_detect_video():
         max_frames = int(max_frames_raw) if max_frames_raw.strip() else None
         write_video = request.form.get("write_video", "1") != "0"
         iou = float(request.form.get("iou", 0.20))
+        
+        # New model configuration parameters
+        model_coco = request.form.get("model_coco", "yolo11s")
+        model_plate = request.form.get("model_plate", "yolo11_plate")
 
         suffix = Path(f.filename).suffix or ".mp4"
         ts_ms = int(time.time() * 1000)
@@ -51,8 +53,8 @@ def api_detect_video():
             stride=stride,
             max_frames=max_frames,
             write_video=write_video,
-            awiros_dir=AWIROS_DIR,
-            yolo_model=str(YOLO_MODEL),
+            yolo_model=model_plate,
+            yolo_coco_model=model_coco,
             device="cpu",
             iou_thresh=iou,
         )
@@ -64,9 +66,24 @@ def api_detect_video():
         report_url = f"/video-results/{out_dir.relative_to(VIDEO_RESULTS_DIR)}/report.html"
 
         tracks_payload = []
+        rel_to_base = out_dir.relative_to(VIDEO_RESULTS_DIR)
+        
         for t in summary["tracks"]:
+            best_crop_url = ""
+            if t.get("best_crop_file"):
+                best_crop_url = f"/video-results/{rel_to_base}/best_frames/{t['best_crop_file']}"
+                
+            best_annotated_url = ""
+            if t.get("best_annotated_file"):
+                best_annotated_url = f"/video-results/{rel_to_base}/best_frames/{t['best_annotated_file']}"
+                
+            vehicle_crop_url = ""
+            if t.get("vehicle_crop_file"):
+                vehicle_crop_url = f"/video-results/{rel_to_base}/best_frames/{t['vehicle_crop_file']}"
+
             tracks_payload.append({
                 "track_id": t["track_id"],
+                "class_name": t.get("class_name", "car"),
                 "final_text": t["final_text"],
                 "final_conf": t["final_conf"],
                 "valid_indian": t["valid_indian"],
@@ -79,12 +96,9 @@ def api_detect_video():
                 "best_frame": t.get("best_frame"),
                 "best_text": t.get("best_text", ""),
                 "best_conf": t.get("best_conf", 0.0),
-                "best_crop_url": (f"/video-results/{out_dir.relative_to(VIDEO_RESULTS_DIR)}/best_frames/{t['best_crop_file']}"
-                                  if t.get("best_crop_file") else ""),
-                # NEW: full annotated frame (with bbox) so user can compare OCR
-                # against the actual frame the plate was seen in.
-                "best_annotated_url": (f"/video-results/{out_dir.relative_to(VIDEO_RESULTS_DIR)}/best_frames/{t['best_annotated_file']}"
-                                        if t.get("best_annotated_file") else ""),
+                "best_crop_url": best_crop_url,
+                "best_annotated_url": best_annotated_url,
+                "vehicle_crop_url": vehicle_crop_url,
                 "all_frames": t.get("all_frames", []),
                 "per_frame_reads": t.get("per_frame_reads", []),
                 "crop_url": "",
@@ -107,7 +121,8 @@ def api_detect_video():
             "annotated_video_url": annotated_video_url,
             "report_url": report_url,
             "engine": {
-                "detector": "YOLO11 (yolo11_plate.pt)",
+                "detector_coco": f"YOLO11 ({model_coco})",
+                "detector_plate": f"YOLO11 ({model_plate})",
                 "ocr": "Awiros ANPR-OCR (PP-OCRv5 SVTR_HGNet / CTC)",
                 "device": "cpu",
                 "voting": "per-character position voting across the track's OCR reads",
@@ -116,6 +131,13 @@ def api_detect_video():
     except Exception as e:
         traceback.print_exc()
         return jsonify(error=str(e)), 500
+
+@video_bp.post("/api/cancel_video")
+def api_cancel_video():
+    """Signal the running video processing loop to stop after the current frame."""
+    from anpr_video_awiros import request_cancel
+    request_cancel()
+    return jsonify(status="cancel_requested")
 
 @video_bp.get("/video-results/<path:relpath>")
 def serve_video_result(relpath):
@@ -150,43 +172,70 @@ def api_track_details(relpath):
 
     video_dir = target_dir.parent
     summary_json = video_dir / "summary.json"
-    tracks_json  = video_dir / "tracks.json"
 
     track = None
-    for jpath in (tracks_json, summary_json):
-        if not jpath.exists():
-            continue
+    if summary_json.exists():
         try:
-            data = json.loads(jpath.read_text(encoding="utf-8"))
+            data = json.loads(summary_json.read_text(encoding="utf-8"))
         except Exception:
-            continue
+            data = {}
         tracks_list = data.get("tracks") or []
         for t in tracks_list:
             if int(t.get("track_id", -1)) == wanted_id:
                 track = t
                 break
-        if track is not None:
-            break
 
     if track is None:
         return jsonify(error=f"Track {wanted_id} not found."), 404
 
     rel_to_base = str(video_dir.relative_to(VIDEO_RESULTS_DIR))
     crop_url_prefix = f"/video-results/{rel_to_base}/crops/"
+    
     best_crop_url = ""
     if track.get("best_crop_file"):
         best_crop_url = f"/video-results/{rel_to_base}/best_frames/{track['best_crop_file']}"
+        
+    best_annotated_url = ""
+    if track.get("best_annotated_file"):
+        best_annotated_url = f"/video-results/{rel_to_base}/best_frames/{track['best_annotated_file']}"
 
+    vehicle_crop_url = ""
+    if track.get("vehicle_crop_file"):
+        vehicle_crop_url = f"/video-results/{rel_to_base}/best_frames/{track['vehicle_crop_file']}"
+
+    # Map frame crops
+    formatted_reads = []
     for r in track.get("per_frame_reads", []):
+        r_copy = r.copy()
         if r.get("crop_file"):
-            r["crop_url"] = crop_url_prefix + r["crop_file"]
-    track["best_crop_url"] = best_crop_url
-    return jsonify(track)
+            r_copy["crop_url"] = crop_url_prefix + r["crop_file"]
+        formatted_reads.append(r_copy)
 
+    payload = {
+        "track_id": track["track_id"],
+        "class_name": track.get("class_name", "car"),
+        "final_text": track["final_text"],
+        "final_conf": track["final_conf"],
+        "valid_indian": track["valid_indian"],
+        "n_frames": track["n_frames"],
+        "first_seen": track["first_seen"],
+        "last_seen": track["last_seen"],
+        "avg_yolo_conf": track["avg_yolo_conf"],
+        "n_unique_reads": track["n_unique_reads"],
+        "votes_per_pos": track["votes_per_pos"],
+        "best_frame": track.get("best_frame"),
+        "best_text": track.get("best_text", ""),
+        "best_conf": track.get("best_conf", 0.0),
+        "best_crop_url": best_crop_url,
+        "best_annotated_url": best_annotated_url,
+        "vehicle_crop_url": vehicle_crop_url,
+        "all_frames": track.get("all_frames", []),
+        "per_frame_reads": formatted_reads,
+    }
+    return jsonify(payload)
 
 @video_bp.get("/walkthrough")
 def api_walkthrough():
-    """Serve walkthrough.html at a short URL."""
     p = (HERE / "walkthrough.html").resolve()
     if not p.exists():
         return jsonify(error="walkthrough.html not generated yet"), 404

@@ -1,0 +1,147 @@
+{
+  "device": "cpu",
+  "frames_dir": "C:\\pinokio\\api\\traffic-plates-pinokio.git\\app\\benchmarks\\frames_50",
+  "n_frames": 50,
+  "image_size": 640,
+  "object_detection": {
+    "yolo11n": {
+      "weights": "C:\\pinokio\\api\\traffic-plates-pinokio.git\\app\\yolo11n.pt",
+      "imgsz": 640,
+      "n": 50,
+      "mean_ms": 107.85,
+      "median_ms": 100.82,
+      "p90_ms": 122.31,
+      "p99_ms": 224.53,
+      "min_ms": 48.58,
+      "max_ms": 224.53,
+      "fps": 9.27
+    },
+    "yolo11s": {
+      "weights": "C:\\pinokio\\api\\traffic-plates-pinokio.git\\app\\yolo11s.pt",
+      "imgsz": 640,
+      "n": 50,
+      "mean_ms": 145.44,
+      "median_ms": 105.79,
+      "p90_ms": 234.52,
+      "p99_ms": 321.36,
+      "min_ms": 86.77,
+      "max_ms": 321.36,
+      "fps": 6.88
+    },
+    "yolo11m": {
+      "weights": "C:\\pinokio\\api\\traffic-plates-pinokio.git\\app\\yolo11m.pt",
+      "imgsz": 640,
+      "n": 50,
+      "mean_ms": 300.65,
+      "median_ms": 303.04,
+      "p90_ms": 366.71,
+      "p99_ms": 462.71,
+      "min_ms": 218.13,
+      "max_ms": 462.71,
+      "fps": 3.33
+    }
+  },
+  "plate_detection": {
+    "yolo11_plate (n)": {
+      "weights": "C:\\pinokio\\api\\traffic-plates-pinokio.git\\app\\yolo11_plate.pt",
+      "imgsz": 640,
+      "total_detections": 86,
+      "detections_per_frame": 1.72,
+      "n": 50,
+      "mean_ms": 88.09,
+      "median_ms": 91.64,
+      "p90_ms": 100.31,
+      "p99_ms": 111.14,
+      "min_ms": 60.59,
+      "max_ms": 111.14,
+      "fps": 11.35
+    },
+    "yolo11s_plate": {
+      "weights": "C:\\pinokio\\api\\traffic-plates-pinokio.git\\app\\yolo11s_plate.pt",
+      "imgsz": 640,
+      "total_detections": 100,
+      "detections_per_frame": 2.0,
+      "n": 50,
+      "mean_ms": 121.93,
+      "median_ms": 116.61,
+      "p90_ms": 139.41,
+      "p99_ms": 169.2,
+      "min_ms": 107.49,
+      "max_ms": 169.2,
+      "fps": 8.2
+    }
+  },
+  "bytetrack": {
+    "weights": "C:\\pinokio\\api\\traffic-plates-pinokio.git\\app\\yolo11s_plate.pt",
+    "tracker_config": "bytetrack.yaml (ultralytics built-in)",
+    "imgsz": 640,
+    "total_track_assignments": 73,
+    "note": "Time includes both YOLO plate detection AND ByteTrack association per frame \u2014 that is the actual pipeline cost.",
+    "n": 50,
+    "mean_ms": 174.67,
+    "median_ms": 174.08,
+    "p90_ms": 186.67,
+    "p99_ms": 213.92,
+    "min_ms": 138.1,
+    "max_ms": 213.92,
+    "fps": 5.73
+  },
+  "awiros_ocr": {
+    "weights": "C:\\pinokio\\api\\traffic-plates-pinokio.git\\app\\awiros_anpr\\model.safetensors",
+    "dict": "C:\\pinokio\\api\\traffic-plates-pinokio.git\\app\\awiros_anpr\\en_dict.txt",
+    "device": "cpu",
+    "n_crops": 113,
+    "n_non_empty": 113,
+    "avg_confidence_non_empty": 0.6738,
+    "samples": [
+      {
+        "text": "HR91A2978",
+        "conf": 1.0
+      },
+      {
+        "text": "HR12AHR51",
+        "conf": 0.6462
+      },
+      {
+        "text": "HR12AF277",
+        "conf": 0.7435
+      },
+      {
+        "text": "52",
+        "conf": 0.1788
+      },
+      {
+        "text": "KA55",
+        "conf": 0.3694
+      },
+      {
+        "text": "GAJ6366",
+        "conf": 0.9169
+      },
+      {
+        "text": "A05AR9761",
+        "conf": 0.8074
+      },
+      {
+        "text": "HR05AR9761",
+        "conf": 0.9998
+      },
+      {
+        "text": "MA0ea8C61",
+        "conf": 0.357
+      },
+      {
+        "text": "MA1",
+        "conf": 0.3493
+      }
+    ],
+    "n": 113,
+    "mean_ms": 2500.34,
+    "median_ms": 2783.37,
+    "p90_ms": 4062.04,
+    "p99_ms": 4238.14,
+    "min_ms": 766.05,
+    "max_ms": 4497.05,
+    "fps": 0.4
+  }
+}

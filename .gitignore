@@ -82,6 +82,9 @@ uploads/
 uploads_videos/
 video_results/
 
+# OpenVINO exported models (regeneratable from .pt via yolo export)
+*_openvino_model/
+
 # Env / secrets
 .env
 *.env.local

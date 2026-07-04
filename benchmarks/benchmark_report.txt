@@ -1,0 +1,52 @@
+================================================================
+ TRAFFIC-PLATES PIPELINE BENCHMARK
+ Device        : cpu
+ Frames        : 50  (from app/benchmarks/frames_50/)
+ Image size    : 640x640
+================================================================
+
+ OBJECT DETECTION (COCO, classes=vehicle+person)
+ ------------------------------------------------------------
+          variant |        mean ms |      median ms |         p90 ms |            fps
+          yolo11n |         107.85 |         100.82 |         122.31 |           9.27
+          yolo11s |         145.44 |         105.79 |         234.52 |           6.88
+          yolo11m |         300.65 |         303.04 |         366.71 |           3.33
+
+ PLATE DETECTION (full-frame)
+ ------------------------------------------------------------
+          variant |        mean ms |      median ms |         p90 ms |            fps
+   yolo11_plate (n) |          88.09 |          91.64 |         100.31 |          11.35
+      total_detections=86  det/frame=1.72
+    yolo11s_plate |         121.93 |         116.61 |         139.41 |            8.2
+      total_detections=100  det/frame=2.0
+
+ BYTETRACK (plate detector + tracker, per-frame)
+ ------------------------------------------------------------
+   mean     : 174.67 ms/frame   (5.73 fps)
+   median   : 174.08 ms       p90: 186.67 ms
+   tracker  : bytetrack.yaml (ultralytics built-in)
+   total track assignments across 50 frames: 73
+   note     : Time includes both YOLO plate detection AND ByteTrack association per frame — that is the actual pipeline cost.
+
+ AWIROS ANPR-OCR  (per plate crop)
+ ------------------------------------------------------------
+   crops OCR'd      : 113
+   non-empty OCR    : 113
+   avg conf (texts) : 0.6738
+   mean latency     : 2500.34 ms/crop    (0.4 crops/s)
+   median           : 2783.37 ms      p90: 4062.04 ms
+   sample OCR reads :
+      "HR91A2978"   conf=1.0
+      "HR12AHR51"   conf=0.6462
+      "HR12AF277"   conf=0.7435
+      "52"   conf=0.1788
+      "KA55"   conf=0.3694
+      "GAJ6366"   conf=0.9169
+      "A05AR9761"   conf=0.8074
+      "HR05AR9761"   conf=0.9998
+      "MA0ea8C61"   conf=0.357
+      "MA1"   conf=0.3493
+
+================================================================
+ Full JSON: C:\pinokio\api\traffic-plates-pinokio.git\app\benchmarks\benchmark_results.json
+================================================================

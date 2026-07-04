@@ -3,301 +3,435 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Traffic Plate Detector — Multi-Plate ANPR (Image + Video)</title>
+    <title>Traffic Management System — Police ANPR Dashboard</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="/static/style.css">
-    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E🚗%3C/text%3E%3C/svg%3E">
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E🚦%3C/text%3E%3C/svg%3E">
 </head>
 <body>
-    <!-- =========================================================
-         Lightbox (click any plate crop or annotated image to zoom)
-         ========================================================= -->
-    <div id="lightbox" class="lightbox" aria-hidden="true">
-        <button class="lightbox-close" type="button" aria-label="Close">✕</button>
-        <img id="lightbox-img" alt="zoom">
+
+<!-- ============================================================ -->
+<!-- MODE TOGGLE (Live / Upload)                                  -->
+<!-- ============================================================ -->
+<section class="mode-bar glass">
+    <div class="mode-toggle">
+        <button class="mode-btn active" data-mode="live">
+            <span class="mode-emoji">📡</span>
+            <span class="mode-label">Live mode</span>
+            <span class="mode-sub">MJPEG stream · sample CCTV loop</span>
+        </button>
+        <button class="mode-btn" data-mode="upload">
+            <span class="mode-emoji">📁</span>
+            <span class="mode-label">Upload mode</span>
+            <span class="mode-sub">image or video · persistent audit trail</span>
+        </button>
     </div>
+</section>
 
-    <main class="app-shell">
-
-        <!-- ============ HEADER (sticky) ============ -->
-        <header class="header">
-            <div class="brand">
-                <span class="logo">🚦</span>
-                <div>
-                    <h1>Traffic Plate Detector</h1>
-                    <p class="tagline">YOLO11 plate detection + Awiros ANPR-OCR · Image &amp; Video · Indian format</p>
-                </div>
-            </div>
-            <div class="stats" id="model-stats" title="Server health">
-                <span class="dot" id="status-dot"></span>
-                <span id="status-text">Connecting…</span>
-            </div>
-        </header>
-
-        <!-- ============ MODE TOGGLE ============ -->
-        <div class="mode-toggle" role="tablist" aria-label="Detection mode">
-            <button class="mode-btn active" data-mode="image" role="tab" aria-selected="true">
-                <span class="mode-emoji">📸</span>
-                <span class="mode-label">
-                    <b>Image</b>
-                    <span class="mode-sub">Single photo · all plates + vehicles</span>
-                </span>
-            </button>
-            <button class="mode-btn" data-mode="video" role="tab" aria-selected="false">
-                <span class="mode-emoji">🎬</span>
-                <span class="mode-label">
-                    <b>Video</b>
-                    <span class="mode-sub">Tracker + per-character voting across frames</span>
-                </span>
-            </button>
+<!-- ============================================================ -->
+<!-- TOP COMMAND BAR                                              -->
+<!-- ============================================================ -->
+<header class="topbar">
+    <div class="brand">
+        <span class="logo">🚦</span>
+        <div>
+            <h1>Traffic Management System</h1>
+            <p class="tagline">Police ANPR · Verifiable Pipeline · Object Detection · Plate OCR · Multi-Object Tracking</p>
         </div>
+    </div>
+    <div class="topbar-right">
+        <div class="health-pill" id="health-pill" title="Pipeline status">
+            <span class="dot" id="health-dot"></span>
+            <span id="health-text">connecting…</span>
+        </div>
+        <button class="btn-ghost" id="btn-benchmark" type="button" title="Benchmark all YOLO11 variants on this machine">
+            ⚡ Benchmark
+        </button>
+    </div>
+</header>
 
-        <!-- ============ UPLOAD ZONE — IMAGE ============ -->
-        <section class="upload-section" id="image-upload-section">
-            <div id="dropzone" class="dropzone">
-                <input type="file" id="file-input" accept="image/*" hidden>
-                <div class="dropzone-content" id="dropzone-content">
-                    <div class="upload-icon">📸</div>
-                    <h2>Drop a traffic photo here</h2>
-                    <p>or <span class="link">click to browse</span></p>
-                    <p class="hint">JPG · PNG · BMP · WEBP &nbsp;·&nbsp; max 200&nbsp;MB &nbsp;·&nbsp; detects plates + all vehicle types</p>
+<!-- ============================================================ -->
+<!-- CONFIG DECK (visible in BOTH modes)                          -->
+<!-- Model pickers + OCR strategy                                 -->
+<!-- ============================================================ -->
+<section class="control-deck glass" id="config-deck">
+    <div class="deck-block">
+        <label class="deck-label">🧠 Models</label>
+        <div class="deck-row">
+            <label class="opt-mini">COCO detector
+                <select id="model-coco" class="opt-select-mini">
+                    <option value="yolo11n" selected>YOLO11 Nano (~150ms/frame CPU)</option>
+                    <option value="yolo11s">YOLO11 Small (~260ms)</option>
+                    <option value="yolo11m">YOLO11 Medium (~600ms, GPU)</option>
+                    <option value="yolo11l">YOLO11 Large (GPU)</option>
+                </select>
+            </label>
+            <label class="opt-mini">Plate detector
+                <select id="model-plate" class="opt-select-mini">
+                    <option value="yolo11_plate" selected>YOLO11 Plate Nano (local)</option>
+                    <option value="yolo11s_plate">YOLO11 Plate Small (HF auto)</option>
+                    <option value="yolo11m_plate">YOLO11 Plate Medium (HF auto)</option>
+                    <option value="yolo11l_plate">YOLO11 Plate Large (HF auto)</option>
+                </select>
+            </label>
+            <label class="opt-mini">OCR strategy
+                <select id="ocr-strategy" class="opt-select-mini">
+                    <option value="best" selected>On best-crop only (recommended)</option>
+                    <option value="every">Every plate (slow)</option>
+                </select>
+            </label>
+        </div>
+    </div>
+</section>
+
+<!-- ============================================================ -->
+<!-- LIVE PANEL (visible only in live mode)                       -->
+<!-- Source picker + start/stop + live viewport + results        -->
+<!-- ============================================================ -->
+<section id="live-panel" class="live-panel">
+    <section class="control-deck glass" id="live-source-deck">
+        <div class="deck-block">
+            <label class="deck-label">📺 Live source</label>
+            <div class="deck-row">
+                <select id="source-select" class="opt-select" aria-label="Live source"></select>
+                <input type="text" id="source-url" class="opt-input" placeholder="…or paste RTSP/HTTP URL or '0' for webcam" />
+                <button id="btn-refresh-sources" class="btn-ghost" type="button" title="Refresh source list">↻</button>
+            </div>
+            <div class="deck-row">
+                <label class="opt-mini">Target FPS
+                    <input type="number" id="target-fps" class="opt-input-mini" min="1" max="30" value="15" />
+                </label>
+                <label class="opt-mini">Loop
+                    <input type="checkbox" id="loop-toggle" checked />
+                </label>
+                <button id="btn-start" class="btn-primary">▶ Start Live</button>
+                <button id="btn-stop" class="btn-danger" disabled>■ Stop</button>
+            </div>
+        </div>
+    </section>
+
+    <main class="main-grid">
+        <section class="viewport-panel glass">
+            <div class="viewport-header">
+                <h3>Live viewport <span class="hint-inline">(clickable canvas · verifiable pipeline)</span></h3>
+                <div class="viewport-meta">
+                    <span class="meta-chip" id="meta-fps">fps —</span>
+                    <span class="meta-chip" id="meta-frame">frame —</span>
+                    <span class="meta-chip" id="meta-size">— × —</span>
+                    <span class="meta-chip" id="meta-session">no session</span>
                 </div>
-                <img id="preview" class="preview hidden" alt="preview">
-                <button id="change-image-btn" class="btn-ghost hidden" type="button">↻ Choose different image</button>
             </div>
 
-            <div class="actions">
-                <button id="detect-btn" class="btn-primary" disabled>
-                    <span class="btn-icon">🔍</span>
-                    <span class="btn-label">Detect Plates + Vehicles</span>
+            <!-- v4: Pipeline stage tabs — each stage renders independently on canvas -->
+            <div class="stage-tabs" id="stage-tabs" role="tablist">
+                <button class="stage-tab active" data-stage="raw" role="tab">
+                    <span class="stage-num">1</span>
+                    <span class="stage-lbl">Raw</span>
+                    <span class="stage-sub">original frame</span>
                 </button>
-                <button id="reset-btn" class="btn-ghost" type="button" disabled>Clear</button>
+                <button class="stage-tab" data-stage="objects" role="tab">
+                    <span class="stage-num">2</span>
+                    <span class="stage-lbl">Objects</span>
+                    <span class="stage-sub">YOLO COCO</span>
+                </button>
+                <button class="stage-tab" data-stage="plates" role="tab">
+                    <span class="stage-num">3</span>
+                    <span class="stage-lbl">Plates</span>
+                    <span class="stage-sub">YOLO plate</span>
+                </button>
+                <button class="stage-tab" data-stage="ocr" role="tab">
+                    <span class="stage-num">4</span>
+                    <span class="stage-lbl">OCR</span>
+                    <span class="stage-sub">Awiros ANPR</span>
+                </button>
+                <button class="stage-tab" data-stage="tracking" role="tab">
+                    <span class="stage-num">5</span>
+                    <span class="stage-lbl">Tracking</span>
+                    <span class="stage-sub">ByteTrack</span>
+                </button>
+                <button class="stage-tab" data-stage="all" role="tab">
+                    <span class="stage-num">⊕</span>
+                    <span class="stage-lbl">All</span>
+                    <span class="stage-sub">combined</span>
+                </button>
+            </div>
+
+            <div class="media-viewport" id="media-viewport">
+                <!-- v4: Canvas replaces <img> — we draw raw MJPEG frame + annotations -->
+                <canvas id="live-canvas" class="viewport-media"></canvas>
+                <div id="viewport-overlay-empty" class="viewport-empty">
+                    <div class="empty-icon">📡</div>
+                    <h2>No live stream</h2>
+                    <p>Pick a source above and click <b>Start Live</b>.</p>
+                    <p class="hint">The canvas will show the raw frame + pipeline annotations per stage.</p>
+                </div>
+            </div>
+
+            <!-- v4: Per-component timing bar -->
+            <div class="timing-bar" id="timing-bar">
+                <div class="timing-segment" data-comp="coco">
+                    <span class="timing-label">COCO</span>
+                    <span class="timing-value" id="timing-coco">— ms</span>
+                </div>
+                <div class="timing-segment" data-comp="plate">
+                    <span class="timing-label">Plate</span>
+                    <span class="timing-value" id="timing-plate">— ms</span>
+                </div>
+                <div class="timing-segment" data-comp="ocr">
+                    <span class="timing-label">OCR</span>
+                    <span class="timing-value" id="timing-ocr">— ms</span>
+                </div>
+                <div class="timing-segment total" data-comp="total">
+                    <span class="timing-label">Total</span>
+                    <span class="timing-value" id="timing-total">— ms</span>
+                </div>
+                <div class="timing-segment" data-comp="ocr-fired">
+                    <span class="timing-label">OCR fired</span>
+                    <span class="timing-value" id="timing-ocr-fired">—</span>
+                </div>
             </div>
         </section>
 
-        <!-- ============ UPLOAD ZONE — VIDEO ============ -->
-        <section class="upload-section hidden" id="video-upload-section">
+        <aside class="results-panel glass">
+            <div class="results-summary">
+                <div class="summary-card">
+                    <div class="summary-num" id="sum-vehicles">0</div>
+                    <div class="summary-label">Vehicles</div>
+                </div>
+                <div class="summary-card success">
+                    <div class="summary-num" id="sum-valid-plates">0</div>
+                    <div class="summary-label">Valid plates</div>
+                </div>
+                <div class="summary-card">
+                    <div class="summary-num" id="sum-plates">0</div>
+                    <div class="summary-label">Total plates</div>
+                </div>
+                <div class="summary-card warn">
+                    <div class="summary-num" id="sum-persons">0</div>
+                    <div class="summary-label">Persons</div>
+                </div>
+            </div>
+
+            <div class="results-tabs" role="tablist">
+                <button class="results-tab active" data-tab="vehicles" role="tab">
+                    🚗 Vehicles <span class="tab-count" id="tab-count-vehicles">0</span>
+                </button>
+                <button class="results-tab" data-tab="plates" role="tab">
+                    🔢 Plates <span class="tab-count" id="tab-count-plates">0</span>
+                </button>
+                <button class="results-tab" data-tab="persons" role="tab">
+                    🚶 Persons <span class="tab-count" id="tab-count-persons">0</span>
+                </button>
+                <button class="results-tab" data-tab="console" role="tab">
+                    📋 Console
+                </button>
+            </div>
+
+            <div class="results-content active" data-tab="vehicles" id="panel-vehicles">
+                <div id="vehicles-list" class="cards-stack">
+                    <p class="empty">No vehicles tracked yet. Start a live stream.</p>
+                </div>
+            </div>
+            <div class="results-content" data-tab="plates" id="panel-plates">
+                <div id="plates-list" class="cards-stack">
+                    <p class="empty">No plates tracked yet.</p>
+                </div>
+            </div>
+            <div class="results-content" data-tab="persons" id="panel-persons">
+                <div id="persons-list" class="cards-stack">
+                    <p class="empty">No persons tracked yet.</p>
+                </div>
+            </div>
+            <div class="results-content" data-tab="console" id="panel-console">
+                <div id="console-log" class="console-log"></div>
+            </div>
+        </aside>
+    </main>
+</section>
+
+<!-- ============================================================ -->
+<!-- UPLOAD PANEL (visible only in upload mode)                  -->
+<!-- ============================================================ -->
+<section id="upload-panel" class="upload-panel hidden">
+
+    <div class="upload-tabs glass" role="tablist">
+        <button class="upload-tab active" data-upload-tab="image" role="tab">
+            📸 Image
+        </button>
+        <button class="upload-tab" data-upload-tab="video" role="tab">
+            🎬 Video
+        </button>
+    </div>
+
+    <div class="upload-grid">
+        <section class="upload-card glass" data-upload-tab-pane="image">
+            <div id="image-dropzone" class="dropzone">
+                <input type="file" id="image-file-input" accept="image/*" hidden>
+                <div class="dropzone-content" id="image-dropzone-content">
+                    <div class="upload-icon">📸</div>
+                    <h2>Drop a traffic photo here</h2>
+                    <p>or <span class="link">click to browse</span></p>
+                    <p class="hint">JPG · PNG · WEBP · BMP</p>
+                </div>
+                <img id="image-preview" class="preview hidden" alt="preview">
+                <button id="image-change-btn" class="btn-ghost hidden" type="button">↻ Choose different image</button>
+            </div>
+            <div class="upload-actions">
+                <button id="image-detect-btn" class="btn-primary" disabled>
+                    <span class="btn-icon">🔍</span>
+                    <span class="btn-label">Run image analysis</span>
+                </button>
+                <button id="image-clear-btn" class="btn-ghost" disabled>Clear</button>
+            </div>
+        </section>
+
+        <section class="upload-card hidden" data-upload-tab-pane="video">
             <div id="video-dropzone" class="dropzone">
                 <input type="file" id="video-file-input" accept="video/*" hidden>
                 <div class="dropzone-content" id="video-dropzone-content">
                     <div class="upload-icon">🎬</div>
                     <h2>Drop a traffic video here</h2>
                     <p>or <span class="link">click to browse</span></p>
-                    <p class="hint">MP4 · MOV · AVI · MKV · WEBM &nbsp;·&nbsp; max 200&nbsp;MB &nbsp;·&nbsp; each plate tracked across frames, OCR reads voted per character</p>
+                    <p class="hint">MP4 · MOV · AVI · WEBM (up to 500 MB)</p>
                 </div>
                 <video id="video-preview" class="preview hidden" controls muted></video>
-                <button id="change-video-btn" class="btn-ghost hidden" type="button">↻ Choose different video</button>
+                <button id="video-change-btn" class="btn-ghost hidden" type="button">↻ Choose different video</button>
             </div>
-
-            <div class="video-options">
-                <div class="opt-row">
-                    <label class="opt-label" for="tracker-select">Tracker</label>
-                    <select id="tracker-select" class="opt-select">
-                        <option value="bytetrack" selected>ByteTrack (fast, default)</option>
-                        <option value="botsort">BoT-SORT (slower, more robust)</option>
-                        <option value="deepocsort">DeepOC-SORT (slower, most accurate)</option>
-                        <option value="deep_sort">DeepSORT (appearance embeddings)</option>
-                    </select>
-                </div>
-                <div class="opt-row">
-                    <label class="opt-label" for="frame-stride">Frame stride</label>
-                    <input type="number" id="frame-stride" class="opt-input" min="1" max="10" value="1" />
-                    <span class="opt-hint">process every Nth frame</span>
-                </div>
-                <div class="opt-row">
-                    <label class="opt-label" for="max-frames">Max frames</label>
-                    <input type="number" id="max-frames" class="opt-input" min="0" placeholder="all" />
-                    <span class="opt-hint">0 = entire video</span>
-                </div>
-                <div class="opt-row">
-                    <label class="opt-label" for="write-video-toggle">Annotated video</label>
-                    <input type="checkbox" id="write-video-toggle" checked />
-                    <span class="opt-hint">uncheck to skip writing annotated.mp4 (faster)</span>
-                </div>
+            <div class="upload-options">
+                <label class="opt-mini">Frame stride
+                    <input type="number" id="upload-frame-stride" class="opt-input-mini" min="1" max="10" value="2" />
+                </label>
+                <label class="opt-mini">Max frames
+                    <input type="number" id="upload-max-frames" class="opt-input-mini" min="0" placeholder="(entire)" />
+                </label>
+                <label class="opt-mini">Write annotated video
+                    <input type="checkbox" id="upload-write-video" checked />
+                </label>
             </div>
-
-            <div class="actions">
-                <button id="detect-video-btn" class="btn-primary" disabled>
+            <div class="upload-actions">
+                <button id="video-detect-btn" class="btn-primary" disabled>
                     <span class="btn-icon">🎬</span>
-                    <span class="btn-label">Process Video</span>
+                    <span class="btn-label">Run video tracking</span>
                 </button>
-                <button id="reset-video-btn" class="btn-ghost" type="button" disabled>Clear</button>
+                <button id="video-stop-btn" class="btn-danger" disabled>■ Stop</button>
+                <button id="video-clear-btn" class="btn-ghost" disabled>Clear</button>
             </div>
         </section>
 
-        <!-- ============ LOADING (shared) ============ -->
-        <div id="loading" class="loading hidden">
-            <div class="spinner"></div>
-            <p id="loading-text">Running YOLO (plates + vehicles) + OCR pipeline…</p>
-            <p class="hint" id="loading-hint">First run may take ~30s to warm up models</p>
-            <div class="progress-bar" aria-hidden="true"></div>
+        <aside class="upload-results glass" id="upload-results-pane">
+            <div class="upload-results-header">
+                <h3 id="upload-results-title">Results</h3>
+                <button id="upload-results-clear" class="btn-ghost hidden">Clear</button>
+            </div>
+            <div id="upload-results-empty" class="upload-empty">
+                <p>Upload an image or video and click Run to see results here.</p>
+                <p class="hint">Results include annotated images / videos, plate OCR text, and per-track audit trails.</p>
+            </div>
+            <div id="upload-results-body" class="hidden"></div>
+        </aside>
+    </div>
+</section>
+
+<!-- ============================================================ -->
+<!-- BENCHMARK PANEL (modal-like, hidden by default)             -->
+<!-- ============================================================ -->
+<section class="benchmark-panel glass hidden" id="benchmark-panel">
+    <div class="benchmark-header">
+        <h3>⚡ YOLO11 benchmark — measured on this machine</h3>
+        <button class="btn-ghost" id="btn-benchmark-close" type="button">✕ Close</button>
+    </div>
+    <div class="benchmark-body">
+        <p class="hint">Times in milliseconds per frame on a 1280×720 sample frame. Lower = better. Use this to decide which variant is fast enough for live streams.</p>
+        <table class="benchmark-table" id="benchmark-table">
+            <thead>
+                <tr>
+                    <th>Model</th>
+                    <th>Kind</th>
+                    <th>min</th>
+                    <th>median</th>
+                    <th>mean</th>
+                    <th>max</th>
+                    <th>max fps</th>
+                    <th>verdict</th>
+                </tr>
+            </thead>
+            <tbody id="benchmark-tbody">
+                <tr><td colspan="8" class="empty">Click "Run benchmark" to measure all variants.</td></tr>
+            </tbody>
+        </table>
+        <button class="btn-primary" id="btn-benchmark-run" type="button">▶ Run benchmark</button>
+    </div>
+</section>
+
+<!-- ============================================================ -->
+<!-- DETAIL MODAL (plate / vehicle / person inspector)          -->
+<!-- ============================================================ -->
+<div id="detail-modal" class="track-modal hidden" aria-hidden="true" role="dialog" aria-modal="true" aria-labelledby="detail-modal-title">
+    <div class="track-modal-card glass">
+        <div class="track-modal-head">
+            <div>
+                <h2 id="detail-modal-title">Detection detail</h2>
+                <p id="detail-modal-sub" class="hint"></p>
+            </div>
+            <button id="detail-modal-close" class="track-modal-close" type="button" aria-label="Close">✕</button>
         </div>
 
-        <!-- ============ ERROR ============ -->
-        <div id="error" class="error-banner hidden" role="alert"></div>
+        <div id="detail-modal-summary" class="detail-summary"></div>
 
-        <!-- ============ IMAGE RESULTS ============ -->
-        <section id="results" class="results hidden">
-            <div class="result-summary">
-                <div class="summary-card">
-                    <div class="summary-num" id="sum-total">0</div>
-                    <div class="summary-label">Plates Found</div>
-                </div>
-                <div class="summary-card success">
-                    <div class="summary-num" id="sum-valid">0</div>
-                    <div class="summary-label">Valid Format</div>
-                </div>
-                <div class="summary-card vehicle">
-                    <div class="summary-num" id="sum-vehicles">0</div>
-                    <div class="summary-label">Vehicles Detected</div>
-                </div>
-                <div class="summary-card">
-                    <div class="summary-num" id="sum-time">0s</div>
-                    <div class="summary-label">Processing Time</div>
-                </div>
+        <div class="track-modal-body">
+            <!-- LEFT: timeline + audit -->
+            <div class="modal-left-pane">
+                <h3>Track timeline</h3>
+                <div id="detail-timeline"></div>
+
+                <h3>Live state <span class="hint-inline">(last seen)</span></h3>
+                <div id="detail-last-seen"></div>
             </div>
 
-            <div id="vehicle-breakdown" class="vehicle-breakdown hidden"></div>
-
-            <div class="result-grid">
-                <div class="result-image-panel">
-                    <h3>
-                        Annotated Result
-                        <span class="hint-inline">(click image to zoom · plates in green/orange, vehicles in class color)</span>
-                    </h3>
-                    <div class="image-wrapper">
-                        <img id="annotated-img" alt="Annotated result">
-                    </div>
-                </div>
-
-                <aside class="result-side-panel">
-                    <div class="result-subpanel">
-                        <h3>Detected Plates <span class="hint-inline" id="plates-count-hint"></span></h3>
-                        <div id="plates-list" class="plates-list">
-                            <p class="empty">No plates detected yet.</p>
+            <!-- RIGHT: best crop + best annotated frame -->
+            <div class="modal-right-pane">
+                <h3>Best crop captured</h3>
+                <div class="modal-images-row">
+                    <div class="img-widget full-w">
+                        <span class="widget-lbl" id="detail-best-crop-label">Best crop (OCR'd at best-bbox frame)</span>
+                        <div class="img-wrap full-frame">
+                            <div id="detail-best-crop" class="placeholder-img">
+                                <p class="empty">No crop available yet.</p>
+                            </div>
                         </div>
                     </div>
-                    <div class="result-subpanel">
-                        <h3>Detected Vehicles <span class="hint-inline" id="vehicles-count-hint"></span></h3>
-                        <div id="vehicles-list" class="vehicles-list">
-                            <p class="empty">No vehicles detected yet.</p>
-                        </div>
-                    </div>
-                </aside>
+                </div>
+
+                <h3>Pipeline metadata</h3>
+                <pre id="detail-meta" class="meta-pre"></pre>
             </div>
-        </section>
-
-        <!-- ============ VIDEO RESULTS ============ -->
-        <section id="video-results" class="results hidden">
-            <div class="result-summary">
-                <div class="summary-card">
-                    <div class="summary-num" id="vsum-tracks">0</div>
-                    <div class="summary-label">Tracks</div>
-                </div>
-                <div class="summary-card success">
-                    <div class="summary-num" id="vsum-valid">0</div>
-                    <div class="summary-label">Valid Plates</div>
-                </div>
-                <div class="summary-card vehicle">
-                    <div class="summary-num" id="vsum-frames">0/0</div>
-                    <div class="summary-label">Frames Processed</div>
-                </div>
-                <div class="summary-card">
-                    <div class="summary-num" id="vsum-time">0s</div>
-                    <div class="summary-label">Processing Time</div>
-                </div>
-            </div>
-
-            <div class="video-meta" id="video-meta-strip"></div>
-
-            <!-- Annotated Video — full width (was left half before) -->
-            <div class="video-full-row">
-                <h3>
-                    Annotated Video
-                    <span class="hint-inline">(bbox + track-id + per-frame OCR + voted text)</span>
-                </h3>
-                <video id="annotated-video" class="annotated-video" controls></video>
-                <div class="video-actions">
-                    <a id="video-download" class="btn-ghost" download="annotated.mp4">⬇ Download annotated.mp4</a>
-                    <a id="report-link" class="btn-ghost" target="_blank">🔍 Open full HTML report</a>
-                    <a id="tracks-json-link" class="btn-ghost" target="_blank">📄 tracks.json</a>
-                </div>
-            </div>
-
-            <!-- Tabs: Detected Plates | Detected Vehicles (each full-width below) -->
-            <div class="results-tabs" role="tablist" aria-label="Video results">
-                <button class="results-tab active" data-tab="plates" role="tab" aria-selected="true">
-                    <span class="tab-icon">🔢</span>
-                    <span class="tab-label">
-                        <b>Detected Number Plates</b>
-                        <span class="tab-sub">per track · voted · click any plate number to see all frames where this vehicle was tracked</span>
-                    </span>
-                </button>
-                <button class="results-tab" data-tab="vehicles" role="tab" aria-selected="false">
-                    <span class="tab-icon">🚗</span>
-                    <span class="tab-label">
-                        <b>Detected Vehicles</b>
-                        <span class="tab-sub">unique vehicles (= one per tracked plate) · click plate number for frame-by-frame details</span>
-                    </span>
-                </button>
-            </div>
-
-            <!-- Tab panel: PLATES (full width) -->
-            <div class="tab-panel active" data-tab="plates" id="panel-plates">
-                <div id="video-tracks-list" class="tracks-list tracks-list-grid">
-                    <p class="empty">No plates detected yet.</p>
-                </div>
-            </div>
-
-            <!-- Tab panel: VEHICLES (full width) -->
-            <div class="tab-panel" data-tab="vehicles" id="panel-vehicles">
-                <div id="video-vehicles-list" class="vehicles-grid">
-                    <p class="empty">No vehicles detected yet.</p>
-                </div>
-            </div>
-        </section>
-
-    </main>
-
-    <!-- ============ TRACK-DETAILS MODAL (NEW) ============
-         Opens when the user clicks a track's best-frame thumbnail.
-         Lists every frame where ByteTrack fetched that plate. -->
-    <div id="track-modal" class="track-modal hidden" aria-hidden="true" role="dialog" aria-modal="true" aria-labelledby="track-modal-title">
-        <div class="track-modal-card">
-            <div class="track-modal-head">
-                <div>
-                    <h2 id="track-modal-title">Track details</h2>
-                    <p id="track-modal-sub" class="hint"></p>
-                </div>
-                <button id="track-modal-close" class="track-modal-close" type="button" aria-label="Close">✕</button>
-            </div>
-            <div id="track-modal-summary" class="video-meta"></div>
-            <div id="track-modal-grid" class="track-modal-grid"></div>
         </div>
     </div>
+</div>
 
-    <!-- ============ FOOTER (page-level, sticks to bottom on short pages) ============ -->
-    <footer class="footer">
-        <div class="footer-inner">
-            <div>
-                <p><b>Traffic Plate Detector</b> — Indian ANPR for traffic photos &amp; video</p>
-                <p class="tech-list">
-                    <span class="badge-pill">YOLO11</span>
-                    <span class="badge-pill">Awiros ANPR-OCR</span>
-                    <span class="badge-pill">PP-OCRv5 SVTR_HGNet / CTC</span>
-                    <span class="badge-pill">ByteTrack</span>
-                    <span class="badge-pill">BoT-SORT</span>
-                    <span class="badge-pill">DeepSORT</span>
-                    <span class="badge-pill">Flask</span>
-                </p>
-                <p class="copyright">Detects: cars · buses · trucks · motorcycles · bicycles · Indian license plates (all formats including BH series)</p>
-            </div>
-            <div class="copyright">
-                <p>Server: <b>http://127.0.0.1:8766</b></p>
-                <p>YOLO model: <code id="footer-model">{{ yolo_model }}</code></p>
-            </div>
+<!-- ============================================================ -->
+<!-- FOOTER                                                       -->
+<!-- ============================================================ -->
+<footer class="footer">
+    <div class="footer-inner">
+        <div>
+            <p><b>Traffic Management System</b> — Police ANPR &amp; Multi-Object Tracker</p>
+            <p class="tech-list">
+                <span class="badge-pill">YOLO11</span>
+                <span class="badge-pill">Awiros ANPR-OCR</span>
+                <span class="badge-pill">ByteTrack</span>
+                <span class="badge-pill">Flask · MJPEG · SSE · Canvas</span>
+            </p>
         </div>
-    </footer>
+        <div class="copyright">
+            <p>Status: <b id="footer-status">ONLINE</b></p>
+            <p>Version: <b>v4.0 (Verifiable Pipeline Inspector)</b></p>
+        </div>
+    </div>
+</footer>
 
-    <script src="/static/script.js"></script>
+<script src="/static/script.js"></script>
 </body>
 </html>

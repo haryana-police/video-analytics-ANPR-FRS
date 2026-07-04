@@ -23,6 +23,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from core.plate_validate import validate_indian_plate as _validate_plate
+
 import cv2
 import numpy as np
 from ultralytics import YOLO
@@ -31,10 +33,13 @@ from ultralytics import YOLO
 # ---------------------------------------------------------------------------
 # Paths / config
 # ---------------------------------------------------------------------------
-DEFAULT_MODEL = "C:/Users/gsash/Downloads/traffic-plates/yolo11_plate.pt"
-DEFAULT_SRC = "C:/Users/gsash/Downloads/test/New folder/images"
-DEFAULT_OUT_PARENT = "C:/Users/gsash/Downloads/test/New folder/images"
-DEFAULT_AWIROS_DIR = "C:/Users/gsash/Downloads/traffic-plates/awiros_anpr"
+# Default paths are resolved relative to the repo root so the script is
+# portable - no hardcoded user-specific folders.
+HERE = Path(__file__).resolve().parent
+DEFAULT_MODEL = str(HERE / "yolo11_plate.pt")
+DEFAULT_SRC = str(HERE / "uploads")
+DEFAULT_OUT_PARENT = str(HERE / "results")
+DEFAULT_AWIROS_DIR = str(HERE / "awiros_anpr")
 VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 
 # PP-OCRv5 server rec / SVTR_HGNet architecture config (from Awiros test.py)
@@ -152,12 +157,28 @@ class AwirosANPR:
         _, h, w = target_shape
         img_h, img_w = img_bgr.shape[:2]
         ratio = h / img_h
-        new_w = min(int(img_w * ratio), w)
-        resized = cv2.resize(img_bgr, (new_w, h))
-        if new_w < w:
-            padded = np.zeros((h, w, 3), dtype=np.uint8)
-            padded[:, :new_w, :] = resized
-            resized = padded
+        new_w = int(img_w * ratio)
+
+        if new_w <= w:
+            # Fits within max width — scale height to 48, pad width if needed.
+            interp = cv2.INTER_AREA if img_h > h else cv2.INTER_CUBIC
+            resized = cv2.resize(img_bgr, (new_w, h), interpolation=interp)
+            if new_w < w:
+                padded = np.zeros((h, w, 3), dtype=np.uint8)
+                padded[:, :new_w, :] = resized
+                resized = padded
+        else:
+            # Exceeds max width — scale to width=320 (height < 48) preserving
+            # aspect ratio, then pad height.  Avoids horizontal squish that
+            # distorts character shapes for wide plates (>6.67:1).
+            w_ratio = w / img_w
+            new_h = int(img_h * w_ratio)
+            interp = cv2.INTER_AREA if img_h > new_h else cv2.INTER_CUBIC
+            resized = cv2.resize(img_bgr, (w, new_h), interpolation=interp)
+            if new_h < h:
+                padded = np.zeros((h, w, 3), dtype=np.uint8)
+                padded[:new_h, :, :] = resized
+                resized = padded
         return resized
 
     @staticmethod
@@ -193,13 +214,20 @@ class AwirosANPR:
             text, confidence = "", 0.0
 
         text = (text or "").strip()
-        # Heuristic: a plate with 4+ alphanumeric chars and conf > 0.2 is "readable"
+        # Heuristic: a plate with 4+ alphanumeric chars and conf > 0.2 is "readable".
+        # Final "is it a real Indian plate?" check uses a regex grammar in
+        # core.plate_validate (BH series + state-series). This keeps the
+        # readable flag lenient (we still surface low-conf detections) while
+        # giving callers a separate `valid_indian` boolean to filter on.
         alnum = sum(c.isalnum() for c in text)
         readable = alnum >= 4 and float(confidence) >= 0.20
+        valid_indian, normalized = _validate_plate(text)
         return {
             "text": text,
+            "normalized_text": normalized,
             "confidence": round(float(confidence), 4),
             "readable": bool(readable),
+            "valid_indian": bool(valid_indian),
         }
 
 
@@ -365,8 +393,12 @@ def detect_folder(
         t_ocr_total = 0.0
         for n, det in enumerate(detections, 1):
             x1, y1, x2, y2 = det["bbox_xyxy"]
-            x1c, y1c = max(0, x1), max(0, y1)
-            x2c, y2c = min(w, x2), min(h, y2)
+            # 6% padding around the plate bbox — matches the video pipeline
+            # and engine.py. Gives OCR context beyond the tight crop edges.
+            pw, ph = x2 - x1, y2 - y1
+            pad_x, pad_y = int(pw * 0.06), int(ph * 0.06)
+            x1c, y1c = max(0, x1 - pad_x), max(0, y1 - pad_y)
+            x2c, y2c = min(w, x2 + pad_x), min(h, y2 + pad_y)
             crop = img[y1c:y2c, x1c:x2c]
             if crop.size == 0:
                 continue
