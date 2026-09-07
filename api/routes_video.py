@@ -1,10 +1,13 @@
-import os
+import sys
 import time
 import json
 import traceback
+import threading
 from datetime import datetime
 from pathlib import Path
 from flask import Blueprint, jsonify, request, send_from_directory
+
+from core.engine import engine
 
 video_bp = Blueprint("video", __name__)
 
@@ -15,18 +18,65 @@ VIDEO_RESULTS_DIR = HERE / "video_results"
 VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
 VIDEO_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
+# One video job at a time: process_video() uses the shared cached YOLO models
+# and resets their ByteTrack state mid-run, so two concurrent jobs would mix
+# track IDs across videos (and the single global cancel flag would cancel both).
+_VIDEO_JOB_LOCK = threading.Lock()
+
+# Result dirs older than this are pruned on each new upload (audit artifacts
+# are the UI's per-track crops/frames — keep a window, not forever).
+RETENTION_DAYS = 7
+
+
+def _prune_old_results():
+    """Delete video-results dirs (and stray uploads) older than RETENTION_DAYS."""
+    cutoff = time.time() - RETENTION_DAYS * 86400
+    for root in (VIDEO_RESULTS_DIR, VIDEOS_DIR):
+        try:
+            entries = list(root.iterdir())
+        except OSError:
+            continue
+        for p in entries:
+            try:
+                if p.stat().st_mtime < cutoff:
+                    if p.is_dir():
+                        import shutil
+                        shutil.rmtree(p, ignore_errors=True)
+                    else:
+                        p.unlink(missing_ok=True)
+            except OSError:
+                continue
+
+
 @video_bp.post("/api/detect_video")
 def api_detect_video():
+    # Non-blocking acquire: reject rather than queue silently for minutes.
+    if not _VIDEO_JOB_LOCK.acquire(blocking=False):
+        return jsonify(error="A video is already being processed. Wait for it to finish or stop it."), 409
+    try:
+        return _detect_video_impl()
+    finally:
+        _VIDEO_JOB_LOCK.release()
+
+
+def _detect_video_impl():
     try:
         f = request.files.get("video")
         if f is None or not f.filename:
             return jsonify(error="No video uploaded. Send a file in the 'video' field."), 400
 
-        stride = max(1, int(request.form.get("frame_stride", 2)))
+        try:
+            stride = max(1, int(request.form.get("frame_stride", 2)))
+        except (TypeError, ValueError):
+            return jsonify(error="frame_stride must be an integer."), 400
         max_frames_raw = request.form.get("max_frames", "")
-        max_frames = int(max_frames_raw) if max_frames_raw.strip() else None
+        try:
+            max_frames = int(max_frames_raw) if max_frames_raw.strip() else None
+        except (TypeError, ValueError):
+            return jsonify(error="max_frames must be an integer."), 400
+        if max_frames is not None and max_frames <= 0:
+            return jsonify(error="max_frames must be positive."), 400
         write_video = request.form.get("write_video", "1") != "0"
-        iou = float(request.form.get("iou", 0.20))
         
         # New model configuration parameters
         model_coco = request.form.get("model_coco", "yolo11s")
@@ -42,22 +92,32 @@ def api_detect_video():
         out_dir = VIDEO_RESULTS_DIR / f"{stem}_awiros_{ts_ms}"
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        import sys
-        sys.path.insert(0, str(HERE))
+        if str(HERE) not in sys.path:
+            sys.path.insert(0, str(HERE))
         from anpr_video_awiros import process_video
-        
+
+        _prune_old_results()
+
         t0 = time.time()
-        summary = process_video(
-            video_path=video_path,
-            out_dir=out_dir,
-            stride=stride,
-            max_frames=max_frames,
-            write_video=write_video,
-            yolo_model=model_plate,
-            yolo_coco_model=model_coco,
-            device="cpu",
-            iou_thresh=iou,
-        )
+        try:
+            summary = process_video(
+                video_path=video_path,
+                out_dir=out_dir,
+                stride=stride,
+                max_frames=max_frames,
+                write_video=write_video,
+                yolo_model=model_plate,
+                yolo_coco_model=model_coco,
+                device="cpu",
+            )
+        finally:
+            # The uploaded source is only needed during processing; result
+            # artifacts live under out_dir. Without this, every upload pins
+            # its full size on disk forever (500 MB cap per file).
+            try:
+                video_path.unlink(missing_ok=True)
+            except OSError:
+                pass
         elapsed = round(time.time() - t0, 2)
 
         annotated_video_url = ""
@@ -81,6 +141,11 @@ def api_detect_video():
             if t.get("vehicle_crop_file"):
                 vehicle_crop_url = f"/video-results/{rel_to_base}/best_frames/{t['vehicle_crop_file']}"
 
+            # In-app audit endpoint (per-frame OCR reads + crops) — the old
+            # report_url pointed at a report.html that process_video never
+            # generated, so links built from it 404'd.
+            audit_url = f"/api/track_details/{rel_to_base}/track_{t['track_id']}"
+
             tracks_payload.append({
                 "track_id": t["track_id"],
                 "class_name": t.get("class_name", "car"),
@@ -99,6 +164,7 @@ def api_detect_video():
                 "best_crop_url": best_crop_url,
                 "best_annotated_url": best_annotated_url,
                 "vehicle_crop_url": vehicle_crop_url,
+                "audit_url": audit_url,
                 "all_frames": t.get("all_frames", []),
                 "per_frame_reads": t.get("per_frame_reads", []),
                 "crop_url": "",
@@ -124,7 +190,7 @@ def api_detect_video():
                 "detector_coco": f"YOLO11 ({model_coco})",
                 "detector_plate": f"YOLO11 ({model_plate})",
                 "ocr": "Awiros ANPR-OCR (PP-OCRv5 SVTR_HGNet / CTC)",
-                "device": "cpu",
+                "device": engine._OPENVINO_DEVICE or "cpu",
                 "voting": "per-character position voting across the track's OCR reads",
             },
         })
@@ -181,7 +247,11 @@ def api_track_details(relpath):
             data = {}
         tracks_list = data.get("tracks") or []
         for t in tracks_list:
-            if int(t.get("track_id", -1)) == wanted_id:
+            try:
+                tid = int(t.get("track_id", -1))
+            except (TypeError, ValueError):
+                continue
+            if tid == wanted_id:
                 track = t
                 break
 

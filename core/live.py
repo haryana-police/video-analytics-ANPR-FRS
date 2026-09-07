@@ -1,5 +1,5 @@
 """
-Live-stream pipeline for the Traffic Management System.
+Live-stream pipeline for Video Analytics ANPR FRS.
 
 Architecture:
     LiveSource       — wraps cv2.VideoCapture for either a local video file
@@ -53,8 +53,8 @@ def _now() -> str:
 class LiveSource:
     """Reads frames from a local video file (looped) or a network camera URL."""
 
-    def __init__(self, source: str, target_fps: float = 25.0, loop: bool = True):
-        self.source = source
+    def __init__(self, source: str | int, target_fps: float = 25.0, loop: bool = True):
+        self.source = source  # int camera index, or str file path / URL
         self.target_fps = max(1.0, float(target_fps))
         self.loop = loop
         self._cap: Optional[cv2.VideoCapture] = None
@@ -67,7 +67,9 @@ class LiveSource:
         self._fps_native = 25.0
         self._width = 0
         self._height = 0
-        self._is_url = source.lower().startswith(("rtsp://", "http://", "https://"))
+        self._is_url = isinstance(source, str) and source.lower().startswith(
+            ("rtsp://", "http://", "https://")
+        )
 
     def start(self):
         if self._thread is not None:
@@ -84,12 +86,13 @@ class LiveSource:
               file=sys.stderr, flush=True)
 
     def stop(self):
+        # Only the reader thread touches self._cap (read/reopen/release) —
+        # releasing a VideoCapture from another thread while the reader is in
+        # cap.read() can crash natively. Signal, wait for the reader to exit,
+        # then drain the frame queue.
         self._stop_event.set()
-        if self._cap:
-            try:
-                self._cap.release()
-            except Exception:
-                pass
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=3.0)
         try:
             while not self._q.empty():
                 self._q.get_nowait()
@@ -121,6 +124,23 @@ class LiveSource:
 
     def _reader(self):
         self._reader_t0 = time.monotonic()
+        try:
+            self._reader_loop()
+        finally:
+            # The reader thread owns the capture lifecycle — release here,
+            # never from another thread (see LiveSource.stop).
+            if self._cap:
+                try:
+                    self._cap.release()
+                except Exception:
+                    pass
+                self._cap = None
+        try:
+            self._q.put_nowait(None)
+        except queue.Full:
+            pass
+
+    def _reader_loop(self):
         while not self._stop_event.is_set():
             ok, frame = self._cap.read() if self._cap else (False, None)
             if not ok or frame is None:
@@ -181,6 +201,7 @@ class TrackState:
     best_bbox_area: int = 0
     best_bbox_xyxy: Optional[list] = None
     best_frame_count: int = 0
+    best_score: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +220,7 @@ class LivePipeline:
         ocr_on_best_only: bool = True,
         iou_thresh: float = 0.20,
         device: str = "cpu",
+        best_crop_algo: str = "area",
     ):
         self.session_id = session_id
         self.source = source
@@ -208,10 +230,15 @@ class LivePipeline:
         self.ocr_on_best_only = ocr_on_best_only
         self.iou_thresh = iou_thresh
         self.device = device
+        # Best-crop selection criterion for the OCR trigger frame:
+        #   "area"      — largest plate bbox seen for the track (default)
+        #   "sharpness" — sharpest crop by Laplacian variance
+        self.best_crop_algo = best_crop_algo if best_crop_algo in ("area", "sharpness") else "area"
 
         self._jpeg_q: "queue.Queue[bytes]" = queue.Queue(maxsize=2)
         self._event_q: "queue.Queue[dict]" = queue.Queue(maxsize=64)
         self._stop_event = threading.Event()
+        self._pause_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
         self.vehicle_states: dict[int, TrackState] = {}
@@ -249,7 +276,22 @@ class LivePipeline:
 
     def stop(self):
         self._stop_event.set()
+        self._pause_event.clear()
         self.source.stop()
+
+    def set_paused(self, paused: bool):
+        """Pause/resume frame processing. While paused the pipeline stops
+        consuming frames: MJPEG freezes on the last frame, SSE goes quiet,
+        and file sources simply hold their position (the reader's 2-slot
+        queue drops frames it can't deliver)."""
+        if paused:
+            self._pause_event.set()
+        else:
+            self._pause_event.clear()
+
+    @property
+    def paused(self) -> bool:
+        return self._pause_event.is_set()
 
     def jpeg_queue(self) -> "queue.Queue[bytes]":
         return self._jpeg_q
@@ -288,6 +330,73 @@ class LivePipeline:
             return b""
         return buf.tobytes()
 
+    def _plate_score(self, frame: np.ndarray, bbox) -> float:
+        """Score a plate bbox by the session's best-crop criterion.
+
+        "area"      → bbox pixel area (cheap)
+        "sharpness" → Laplacian variance of the crop resized to 100x40
+                      (normalizes for crop size so it measures intrinsic
+                      blur — same metric as anpr_video_awiros._crop_sharpness)
+        """
+        x1, y1, x2, y2 = bbox
+        if self.best_crop_algo != "sharpness":
+            return float((x2 - x1) * (y2 - y1))
+        try:
+            from anpr_video_awiros import _crop_sharpness
+            H, W = frame.shape[:2]
+            crop = frame[max(0, int(y1)):min(H, int(y2)), max(0, int(x1)):min(W, int(x2))]
+            return _crop_sharpness(crop)
+        except Exception:
+            return float((x2 - x1) * (y2 - y1))
+
+    @staticmethod
+    def _crop_with_padding(frame: np.ndarray, bbox: list) -> np.ndarray:
+        """Crop a bbox region with 6% padding, clamped to frame bounds."""
+        H, W = frame.shape[:2]
+        bx1, by1, bx2, by2 = bbox
+        bw, bh = bx2 - bx1, by2 - by1
+        px, py = int(bw * 0.06), int(bh * 0.06)
+        cx1 = max(0, int(bx1) - px)
+        cy1 = max(0, int(by1) - py)
+        cx2 = min(W, int(bx2) + px)
+        cy2 = min(H, int(by2) + py)
+        return frame[cy1:cy2, cx1:cx2]
+
+    def _run_ocr(self, crop: np.ndarray) -> tuple[str, float, bool, float]:
+        """Run Awiros OCR on a crop.
+
+        Thread-safety lives inside AwirosANPR.predict_crop() itself
+        (AWIROS_PREDICT_LOCK), so every caller — live sessions, upload
+        endpoints, benchmarks — is serialized against PaddlePaddle's
+        non-thread-safe static graph.
+        Returns (text, confidence, valid_indian, elapsed_ms). elapsed_ms is
+        0.0 when OCR did not actually run (empty crop or error).
+        """
+        if crop is None or crop.size == 0:
+            return "", 0.0, False, 0.0
+        t0 = time.time()
+        try:
+            res = self.awiros.predict_crop(crop)
+            text = res.get("text", "") or ""
+            conf = float(res.get("confidence", 0.0))
+            valid = bool(res.get("valid_indian", False))
+            return text, conf, valid, (time.time() - t0) * 1000
+        except Exception as e:
+            print(f"[live] {_now()} OCR error: {e}", file=sys.stderr, flush=True)
+            return "", 0.0, False, 0.0
+
+    def _link_ocr_to_vehicle(self, plate_tid: int, text: str, conf: float, valid: bool):
+        """Propagate an OCR result onto the associated vehicle's track state."""
+        v_tid = self._plate_to_vehicle.get(plate_tid)
+        if v_tid is None:
+            return
+        vst = self.vehicle_states.get(v_tid)
+        if vst is not None:
+            vst.plate_text = text
+            vst.plate_conf = conf
+            vst.plate_valid = valid
+            vst.plate_track_id = plate_tid
+
     def _run(self):
         try:
             self._run_inner()
@@ -300,17 +409,19 @@ class LivePipeline:
         self.source.start()
         self.t_start = time.time()
         self.t_last_frame = time.time()
-        first_frame = True
 
         while not self._stop_event.is_set():
+            if self._pause_event.is_set():
+                # Frozen: hold last MJPEG frame, emit nothing.
+                time.sleep(0.15)
+                continue
             try:
                 frame = self.source.read(timeout=1.0)
                 if frame is None:
                     if self.source._stop_event.is_set():
                         break
                     continue
-                self._process_frame(frame, first_frame)
-                first_frame = False
+                self._process_frame(frame)
             except Exception as e:
                 print(f"[live] {_now()} frame loop error: {e}", file=sys.stderr, flush=True)
                 traceback.print_exc(file=sys.stderr)
@@ -320,7 +431,7 @@ class LivePipeline:
         print(f"[live] {_now()} _run_inner exiting sid={self.session_id} frames={self.frame_index}",
               file=sys.stderr, flush=True)
 
-    def _process_frame(self, frame, first_frame):
+    def _process_frame(self, frame):
         """Process one frame through the full pipeline — v4 verifiable mode.
 
         Sends RAW (un-annotated) frames via MJPEG. All detection data goes
@@ -434,36 +545,37 @@ class LivePipeline:
                         st.best_frame_count = self.frame_index
 
         # Plates: associate with vehicles by containment
+        current_plate_tids: set[int] = set()
         for plate_tid, bbox, yconf in tracked_plates:
             px1, py1, px2, py2 = bbox
             p_area = (px2 - px1) * (py2 - py1)
             if p_area <= 0:
                 continue
+            current_plate_tids.add(plate_tid)
+            score = self._plate_score(frame, bbox)
             # trajectory for plate track
             pcx, pcy = (px1 + px2) // 2, (py1 + py2) // 2
             self._trajectories[plate_tid].append((self.frame_index, pcx, pcy))
             pst = self.plate_states.get(plate_tid)
-            is_new_best = False
             if pst is None:
                 pst = TrackState(
                     track_id=plate_tid, class_name="plate",
                     first_seen_ms=ts_ms, last_seen_ms=ts_ms,
                     last_bbox_xyxy=list(bbox), last_conf=yconf,
                     best_bbox_area=p_area, best_bbox_xyxy=list(bbox),
-                    best_frame_count=self.frame_index,
+                    best_frame_count=self.frame_index, best_score=score,
                 )
                 self.plate_states[plate_tid] = pst
-                is_new_best = True
             else:
                 pst.last_seen_ms = ts_ms
                 pst.last_bbox_xyxy = list(bbox)
                 pst.last_conf = yconf
                 pst.n_frames += 1
-                if p_area > pst.best_bbox_area:
+                if score > pst.best_score:
+                    pst.best_score = score
                     pst.best_bbox_area = p_area
                     pst.best_bbox_xyxy = list(bbox)
                     pst.best_frame_count = self.frame_index
-                    is_new_best = True
 
             best_v = None
             best_overlap = 0.0
@@ -482,53 +594,52 @@ class LivePipeline:
             if best_v is not None:
                 self._plate_to_vehicle[plate_tid] = best_v
 
-        # ── OCR scheduling — run once per plate track at best-crop frame ──
+        # ── OCR stage — per-session strategy ──
+        #   "best"  (ocr_on_best_only=True): run Awiros once per plate track,
+        #           at the frame where its bbox is largest (best crop).
+        #           Recommended — Awiros is ~2.5 s/crop on CPU.
+        #   "every" (ocr_on_best_only=False): run OCR on every visible plate
+        #           each frame and keep the highest-confidence read.
+        #           Spec's "every frame" strategy; very slow on CPU by design.
         dt_ocr_ms = 0.0
         ocr_fired_this_frame = False
-        for plate_tid, pst in list(self.plate_states.items()):
-            if pst.ocr_done or pst.ocr_scheduled:
-                continue
-            if self.frame_index == pst.best_frame_count and pst.best_bbox_xyxy is not None:
-                pst.ocr_scheduled = True
-                bx1, by1, bx2, by2 = pst.best_bbox_xyxy
-                bw, bh = bx2 - bx1, by2 - by1
-                px, py = int(bw * 0.06), int(bh * 0.06)
-                cx1 = max(0, bx1 - px); cy1 = max(0, by1 - py)
-                cx2 = min(W, bx2 + px); cy2 = min(H, by2 + py)
-                crop = frame[cy1:cy2, cx1:cx2]
-                if crop.size > 0 and self.awiros is not None:
-                    try:
-                        # v4: Hold the global _AWIROS_LOCK so PaddlePaddle's
-                        # static graph doesn't clash with a concurrent
-                        # /api/live/benchmark request in another thread.
-                        from core.live import _AWIROS_LOCK
-                        t_ocr_start = _time.time()
-                        with _AWIROS_LOCK:
-                            res = self.awiros.predict_crop(crop)
-                        text = res.get("text", "") or ""
-                        conf = float(res.get("confidence", 0.0))
-                        valid = bool(res.get("valid_indian", False))
-                        dt_ocr_ms = (_time.time() - t_ocr_start) * 1000
+        if self.awiros is not None:
+            if self.ocr_on_best_only:
+                for plate_tid, pst in list(self.plate_states.items()):
+                    if pst.ocr_done or pst.ocr_scheduled:
+                        continue
+                    if self.frame_index == pst.best_frame_count and pst.best_bbox_xyxy is not None:
+                        pst.ocr_scheduled = True
+                        crop = self._crop_with_padding(frame, pst.best_bbox_xyxy)
+                        text, conf, valid, ms = self._run_ocr(crop)
+                        if ms > 0:
+                            dt_ocr_ms += ms
+                            ocr_fired_this_frame = True
+                        pst.plate_text = text
+                        pst.plate_conf = conf
+                        pst.plate_valid = valid
+                        pst.ocr_done = True
+                        self._best_crops[plate_tid] = self._encode_crop_jpeg(crop)
+                        self._link_ocr_to_vehicle(plate_tid, text, conf, valid)
+            else:
+                for plate_tid in current_plate_tids:
+                    pst = self.plate_states.get(plate_tid)
+                    if pst is None or pst.last_bbox_xyxy is None:
+                        continue
+                    crop = self._crop_with_padding(frame, pst.last_bbox_xyxy)
+                    text, conf, valid, ms = self._run_ocr(crop)
+                    if ms > 0:
+                        dt_ocr_ms += ms
                         ocr_fired_this_frame = True
-                    except Exception as e:
-                        print(f"[live] OCR error: {e}", file=sys.stderr, flush=True)
-                        text, conf, valid = "", 0.0, False
-                else:
-                    text, conf, valid = "", 0.0, False
-                pst.plate_text = text
-                pst.plate_conf = conf
-                pst.plate_valid = valid
-                pst.ocr_done = True
-                # v4: store best crop JPEG bytes for modal inspection
-                self._best_crops[plate_tid] = self._encode_crop_jpeg(crop)
-                v_tid = self._plate_to_vehicle.get(plate_tid)
-                if v_tid is not None:
-                    vst = self.vehicle_states.get(v_tid)
-                    if vst is not None:
-                        vst.plate_text = text
-                        vst.plate_conf = conf
-                        vst.plate_valid = valid
-                        vst.plate_track_id = plate_tid
+                    # Keep the best read so far for this track
+                    if (not pst.ocr_done) or conf >= pst.plate_conf:
+                        pst.plate_text = text
+                        pst.plate_conf = conf
+                        pst.plate_valid = valid
+                        self._best_crops[plate_tid] = self._encode_crop_jpeg(crop)
+                        self._link_ocr_to_vehicle(plate_tid, pst.plate_text,
+                                                  pst.plate_conf, pst.plate_valid)
+                    pst.ocr_done = True
 
         # ── Send RAW frame via MJPEG (no annotation) ──
         jpeg = self._encode_jpeg_raw(frame)
@@ -554,103 +665,137 @@ class LivePipeline:
             "ocr_fired": ocr_fired_this_frame,
         }
 
-        # ── Emit enriched SSE event ──
-        if first_frame or (self.frame_index % 3 == 0):
-            # Build raw per-frame detection lists for client-side canvas rendering
-            coco_dets_payload = [
-                {
-                    "track_id": d["track_id"],
-                    "class_name": d["class_name"],
-                    "bbox_xyxy": d["bbox_xyxy"],
-                    "confidence": round(d["confidence"], 3),
-                }
-                for d in coco_dets
-            ]
-            plate_dets_payload = [
-                {
-                    "track_id": pst.track_id,
-                    "bbox_xyxy": pst.last_bbox_xyxy,
-                    "confidence": round(pst.last_conf, 3),
-                    "text": pst.plate_text,
-                    "ocr_conf": round(pst.plate_conf, 3),
-                    "valid": pst.plate_valid,
-                    "linked_vehicle_id": self._plate_to_vehicle.get(pst.track_id),
-                    "ocr_done": pst.ocr_done,
-                    "best_frame_count": pst.best_frame_count,
-                }
-                for pst in self.plate_states.values()
-                if pst.last_bbox_xyxy is not None
-            ]
-            person_dets_payload = [
-                {
-                    "track_id": d["track_id"],
-                    "bbox_xyxy": d["bbox_xyxy"],
-                    "confidence": round(d["confidence"], 3),
-                }
-                for d in coco_dets if d["class_name"] == "person"
-            ]
-            # Trajectories for Tracking stage — only send CURRENT frame's active
-            # track centroids (not full history) to keep payload small.
-            # The frontend accumulates trajectory points client-side.
-            trajectories_payload = {
-                str(tid): list(self._trajectories[tid])[-3:]  # last 3 points only
-                for tid in list(self._trajectories.keys())[-50:]  # last 50 tracks
-            }
+        # ── Emit enriched SSE event (every frame — annotations must stay in
+        # sync with the raw MJPEG frames for the verifiable-pipeline view;
+        # slow clients are protected by the queue's drop-oldest policy) ──
+        self._emit_frame_event(coco_dets, W, H)
 
-            self._emit_event("frame", {
-                "frame_index": self.frame_index,
-                "frame_size": [W, H],
-                "fps": round(self.fps_actual, 2),
-                "timing": self.last_timing,
-                "coco_detections": coco_dets_payload,
-                "plate_detections": plate_dets_payload,
-                "person_detections": person_dets_payload,
-                "trajectories": trajectories_payload,
-                "vehicles": [
-                    {
-                        "track_id": st.track_id,
-                        "class_name": st.class_name,
-                        "bbox_xyxy": st.last_bbox_xyxy,
-                        "confidence": round(st.last_conf, 3),
-                        "n_frames": st.n_frames,
-                        "plate_text": st.plate_text,
-                        "plate_conf": st.plate_conf,
-                        "plate_valid": st.plate_valid,
-                        "plate_track_id": st.plate_track_id,
-                        "best_bbox_xyxy": st.best_bbox_xyxy,
-                        "best_frame_count": st.best_frame_count,
-                        "ocr_done": st.ocr_done,
-                    }
-                    for st in self.vehicle_states.values()
-                ],
-                "persons": [
-                    {
-                        "track_id": st.track_id,
-                        "bbox_xyxy": st.last_bbox_xyxy,
-                        "confidence": round(st.last_conf, 3),
-                        "n_frames": st.n_frames,
-                        "best_bbox_xyxy": st.best_bbox_xyxy,
-                        "best_frame_count": st.best_frame_count,
-                    }
-                    for st in self.person_states.values()
-                ],
-                "plates": [
-                    {
-                        "track_id": st.track_id,
-                        "bbox_xyxy": st.last_bbox_xyxy,
-                        "confidence": round(st.last_conf, 3),
-                        "n_frames": st.n_frames,
-                        "text": st.plate_text,
-                        "ocr_conf": st.plate_conf,
-                        "valid": st.plate_valid,
-                        "linked_vehicle_id": self._plate_to_vehicle.get(st.track_id),
-                        "best_bbox_xyxy": st.best_bbox_xyxy,
-                        "best_frame_count": st.best_frame_count,
-                        "ocr_done": st.ocr_done,
-                    }
-                    for st in self.plate_states.values()
-                ],
-            })
+        # ── Prune stale tracks so long-running sessions stay bounded ──
+        self._prune_stale(ts_ms)
+
+    # Drop track state not seen for this long (ms). Live cards/overlays only
+    # make sense for currently-active objects anyway.
+    PRUNE_AFTER_MS = 15_000
+    MAX_BEST_CROPS = 60
+
+    def _prune_stale(self, ts_ms: int):
+        def prune_dict(d: dict):
+            dead = [tid for tid, st in d.items()
+                    if ts_ms - st.last_seen_ms > self.PRUNE_AFTER_MS]
+            for tid in dead:
+                del d[tid]
+            return set(dead)
+
+        dead_total = set()
+        dead_total |= prune_dict(self.vehicle_states)
+        dead_total |= prune_dict(self.person_states)
+        dead_total |= prune_dict(self.plate_states)
+        for tid in dead_total:
+            self._trajectories.pop(tid, None)
+
+        # Cap cached crops (dict preserves insertion order → drop oldest)
+        excess = len(self._best_crops) - self.MAX_BEST_CROPS
+        if excess > 0:
+            for tid in list(self._best_crops.keys())[:excess]:
+                del self._best_crops[tid]
+
+    def _emit_frame_event(self, coco_dets: list, W: int, H: int):
+        """Build and enqueue one enriched 'frame' SSE event."""
+        # Build raw per-frame detection lists for client-side canvas rendering
+        coco_dets_payload = [
+            {
+                "track_id": d["track_id"],
+                "class_name": d["class_name"],
+                "bbox_xyxy": d["bbox_xyxy"],
+                "confidence": round(d["confidence"], 3),
+            }
+            for d in coco_dets
+        ]
+        plate_dets_payload = [
+            {
+                "track_id": pst.track_id,
+                "bbox_xyxy": pst.last_bbox_xyxy,
+                "confidence": round(pst.last_conf, 3),
+                "text": pst.plate_text,
+                "ocr_conf": round(pst.plate_conf, 3),
+                "valid": pst.plate_valid,
+                "linked_vehicle_id": self._plate_to_vehicle.get(pst.track_id),
+                "ocr_done": pst.ocr_done,
+                "best_frame_count": pst.best_frame_count,
+            }
+            for pst in self.plate_states.values()
+            if pst.last_bbox_xyxy is not None
+        ]
+        person_dets_payload = [
+            {
+                "track_id": d["track_id"],
+                "bbox_xyxy": d["bbox_xyxy"],
+                "confidence": round(d["confidence"], 3),
+            }
+            for d in coco_dets if d["class_name"] == "person"
+        ]
+        # Trajectories for Tracking stage — only send CURRENT frame's active
+        # track centroids (not full history) to keep payload small.
+        # The frontend accumulates trajectory points client-side.
+        trajectories_payload = {
+            str(tid): list(self._trajectories[tid])[-3:]  # last 3 points only
+            for tid in list(self._trajectories.keys())[-50:]  # last 50 tracks
+        }
+
+        self._emit_event("frame", {
+            "frame_index": self.frame_index,
+            "frame_size": [W, H],
+            "fps": round(self.fps_actual, 2),
+            "timing": self.last_timing,
+            "coco_detections": coco_dets_payload,
+            "plate_detections": plate_dets_payload,
+            "person_detections": person_dets_payload,
+            "trajectories": trajectories_payload,
+            "vehicles": [
+                {
+                    "track_id": st.track_id,
+                    "class_name": st.class_name,
+                    "bbox_xyxy": st.last_bbox_xyxy,
+                    "confidence": round(st.last_conf, 3),
+                    "n_frames": st.n_frames,
+                    "plate_text": st.plate_text,
+                    "plate_conf": st.plate_conf,
+                    "plate_valid": st.plate_valid,
+                    "plate_track_id": st.plate_track_id,
+                    "best_bbox_xyxy": st.best_bbox_xyxy,
+                    "best_frame_count": st.best_frame_count,
+                    "ocr_done": st.ocr_done,
+                }
+                for st in self.vehicle_states.values()
+            ],
+            "persons": [
+                {
+                    "track_id": st.track_id,
+                    "bbox_xyxy": st.last_bbox_xyxy,
+                    "confidence": round(st.last_conf, 3),
+                    "n_frames": st.n_frames,
+                    "best_bbox_xyxy": st.best_bbox_xyxy,
+                    "best_frame_count": st.best_frame_count,
+                }
+                for st in self.person_states.values()
+            ],
+            "plates": [
+                {
+                    "track_id": st.track_id,
+                    "bbox_xyxy": st.last_bbox_xyxy,
+                    "confidence": round(st.last_conf, 3),
+                    "n_frames": st.n_frames,
+                    "text": st.plate_text,
+                    "ocr_conf": st.plate_conf,
+                    "valid": st.plate_valid,
+                    "linked_vehicle_id": self._plate_to_vehicle.get(st.track_id),
+                    "best_bbox_xyxy": st.best_bbox_xyxy,
+                    "best_frame_count": st.best_frame_count,
+                    "ocr_done": st.ocr_done,
+                }
+                for st in self.plate_states.values()
+            ],
+        })
 
 
 # ---------------------------------------------------------------------------
@@ -662,6 +807,7 @@ class LiveSession:
         self.pipeline = pipeline
         self.created_ms = int(time.time() * 1000)
         self.last_active_ms = self.created_ms
+        self.active_streams = 0  # attached MJPEG + SSE clients
         self.meta: dict = {}
 
 
@@ -669,6 +815,7 @@ class LiveSessionManager:
     def __init__(self):
         self._sessions: dict[str, LiveSession] = {}
         self._lock = threading.Lock()
+        self._janitor_started = False
 
     def get(self, sid: str) -> Optional[LiveSession]:
         with self._lock:
@@ -677,6 +824,7 @@ class LiveSessionManager:
     def add(self, sid: str, session: LiveSession):
         with self._lock:
             self._sessions[sid] = session
+            self._ensure_janitor_locked()
 
     def remove(self, sid: str):
         with self._lock:
@@ -685,6 +833,57 @@ class LiveSessionManager:
     def list_ids(self) -> list[str]:
         with self._lock:
             return list(self._sessions.keys())
+
+    # -- stream connection tracking -------------------------------------
+    def stream_open(self, sid: str):
+        with self._lock:
+            s = self._sessions.get(sid)
+            if s is not None:
+                s.active_streams += 1
+
+    def stream_close(self, sid: str):
+        with self._lock:
+            s = self._sessions.get(sid)
+            if s is not None:
+                s.active_streams = max(0, s.active_streams - 1)
+
+    def touch(self, sid: str):
+        with self._lock:
+            s = self._sessions.get(sid)
+            if s is not None:
+                s.last_active_ms = int(time.time() * 1000)
+
+    def _ensure_janitor_locked(self):
+        """Start the background reaper once. It auto-stops sessions whose
+        MJPEG + SSE clients have all disconnected (e.g. the browser tab was
+        closed without pressing Stop) so pipelines/threads don't leak."""
+        if self._janitor_started:
+            return
+        self._janitor_started = True
+
+        def _janitor():
+            grace_ms = 120_000  # 2 min with zero attached streams
+            while True:
+                time.sleep(30)
+                now_ms = int(time.time() * 1000)
+                dead = []
+                with self._lock:
+                    for sid, s in self._sessions.items():
+                        if s.active_streams <= 0 and now_ms - s.last_active_ms > grace_ms:
+                            dead.append(sid)
+                for sid in dead:
+                    s = self.get(sid)
+                    if s is None:
+                        continue
+                    try:
+                        s.pipeline.stop()
+                    except Exception:
+                        log.exception("janitor: error stopping pipeline %s", sid)
+                    self.remove(sid)
+                    log.info("janitor: reaped idle session %s (no streams for %.0fs)",
+                             sid, grace_ms / 1000)
+
+        threading.Thread(target=_janitor, daemon=True, name="LiveSessionJanitor").start()
 
 
 # ---------------------------------------------------------------------------
@@ -696,35 +895,24 @@ class LiveSessionManager:
 # to each component.
 #
 # Source priority:
-#   1. app/static/benchmark_sample.jpg  (pinned copy in the project, always exists)
-#   2. C:\Users\harsh\Downloads\cctv samples\1.mp4  frame 90 (original CCTV source)
-#   3. A 720x1280 zero array (last-resort fallback if both above are missing)
-_BENCHMARK_SAMPLE_REL = "app/static/benchmark_sample.jpg"
-_BENCHMARK_SAMPLE_FALLBACK_VIDEO = Path(r"C:\Users\harsh\Downloads\cctv samples\1.mp4")
-_BENCHMARK_SAMPLE_FALLBACK_FRAME_IDX = 90
+#   1. static/benchmark_sample.jpg  (pinned copy committed in the repo)
+#   2. A 720x1280 zero array (last-resort fallback if the pinned copy is missing)
+_BENCHMARK_SAMPLE_REL = "static/benchmark_sample.jpg"
 
 
 def _load_benchmark_frame() -> np.ndarray:
     """Return a single representative 1280x720 BGR frame for benchmarking.
 
-    Pinned source: app/static/benchmark_sample.jpg (committed copy). Falls
-    back to frame 90 of 1.mp4 in the CCTV samples dir, then to a zero array.
+    Pinned source: static/benchmark_sample.jpg (committed copy). Falls back
+    to a zero array if it is missing.
     """
-    # 1) Pinned project copy
-    sample_path = Path(_BENCHMARK_SAMPLE_REL)
+    # 1) Pinned repo copy (resolved relative to the repo root)
+    sample_path = Path(__file__).resolve().parent.parent / _BENCHMARK_SAMPLE_REL
     if sample_path.exists():
         frame = cv2.imread(str(sample_path))
         if frame is not None:
             return frame
-    # 2) Fallback: extract frame 90 from the original CCTV sample
-    if _BENCHMARK_SAMPLE_FALLBACK_VIDEO.exists():
-        cap = cv2.VideoCapture(str(_BENCHMARK_SAMPLE_FALLBACK_VIDEO))
-        cap.set(cv2.CAP_PROP_POS_FRAMES, _BENCHMARK_SAMPLE_FALLBACK_FRAME_IDX)
-        ok, f = cap.read()
-        cap.release()
-        if ok and f is not None:
-            return f
-    # 3) Last resort
+    # 2) Last resort
     return np.zeros((720, 1280, 3), dtype=np.uint8)
 
 

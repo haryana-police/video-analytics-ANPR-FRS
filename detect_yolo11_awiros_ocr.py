@@ -19,6 +19,7 @@ import argparse
 import copy
 import json
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -46,6 +47,20 @@ VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 CTC_NUM_CLASSES = 64
 NRTR_NUM_CLASSES = 67  # NRTRHead adds +1 internally -> 68 to match weights
 IMAGE_SHAPE = [3, 48, 320]
+
+# Crops shorter than this virtually never yield a usable read from Awiros.
+# Enforced inside predict_crop() so EVERY pipeline path (video, live,
+# image API, folder CLI) shares one policy instead of burning ~850 ms of
+# CPU per hopeless crop. (Formerly the unused OCR_MIN_HEIGHT tunable in
+# anpr_video_awiros.py.)
+MIN_CROP_HEIGHT = 18
+
+# PaddlePaddle's static graph is NOT thread-safe: a predict_crop() call from a
+# second thread corrupts the shared program (compat meta-tensor invalidated).
+# Serializing INSIDE predict_crop() protects every caller — live sessions,
+# /api/detect, /api/detect_video, benchmarks — no matter which thread or how
+# many concurrent Flask requests reach it.
+AWIROS_PREDICT_LOCK = threading.RLock()
 
 MODEL_CONFIG = {
     "Architecture": {
@@ -106,8 +121,8 @@ class AwirosANPR:
         if not self.paddleocr_dir.is_dir():
             raise FileNotFoundError(
                 f"PaddleOCR repo not found at {self.paddleocr_dir}. "
-                "Run the official test.py once so it auto-clones, or `git clone "
-                "--depth 1 https://github.com/PaddlePaddle/PaddleOCR` into that path."
+                "Restore it with: git clone --depth 1 "
+                "https://github.com/PaddlePaddle/PaddleOCR into that path."
             )
         root = str(self.paddleocr_dir)
         if root not in sys.path:
@@ -189,25 +204,33 @@ class AwirosANPR:
         return img.transpose((2, 0, 1))
 
     def predict_crop(self, crop_bgr) -> dict:
-        """Run OCR on one cropped plate BGR image."""
+        """Run OCR on one cropped plate BGR image (thread-serialized).
+
+        Crops shorter than MIN_CROP_HEIGHT are skipped without inference —
+        Awiros virtually never reads them, and each call costs ~850 ms CPU.
+        Returns the same shape as an unreadable crop so callers need no
+        special-casing.
+        """
         self.load()
-        if crop_bgr is None or crop_bgr.size == 0:
+        if (crop_bgr is None or crop_bgr.size == 0
+                or crop_bgr.shape[0] < MIN_CROP_HEIGHT):
             return {"text": "", "confidence": 0.0, "readable": False}
 
-        tensor = self.paddle.to_tensor(
-            np.expand_dims(self._preprocess(crop_bgr, IMAGE_SHAPE), axis=0)
-        )
-        with self.paddle.no_grad():
-            preds = self.model(tensor)
+        with AWIROS_PREDICT_LOCK:
+            tensor = self.paddle.to_tensor(
+                np.expand_dims(self._preprocess(crop_bgr, IMAGE_SHAPE), axis=0)
+            )
+            with self.paddle.no_grad():
+                preds = self.model(tensor)
 
-        if isinstance(preds, dict):
-            pred_tensor = preds.get("ctc", next(iter(preds.values())))
-        elif isinstance(preds, (list, tuple)):
-            pred_tensor = preds[0]
-        else:
-            pred_tensor = preds
+            if isinstance(preds, dict):
+                pred_tensor = preds.get("ctc", next(iter(preds.values())))
+            elif isinstance(preds, (list, tuple)):
+                pred_tensor = preds[0]
+            else:
+                pred_tensor = preds
 
-        post_result = self.post_process(pred_tensor.numpy())
+            post_result = self.post_process(pred_tensor.numpy())
         if isinstance(post_result, (list, tuple)) and len(post_result) > 0:
             text, confidence = post_result[0]
         else:
@@ -403,7 +426,9 @@ def detect_folder(
             if crop.size == 0:
                 continue
             stem = img_path.stem
-            crop_name = f"{stem}_plate{n}_{det['confidence']:.2f}.jpg"
+            # PNG: pixel-exact record of what the OCR engine saw
+            # (no JPEG recompression of the evidence)
+            crop_name = f"{stem}_plate{n}_{det['confidence']:.2f}.png"
             crop_path = out_crops / crop_name
             cv2.imwrite(str(crop_path), crop)
             det["crop_file"] = crop_name

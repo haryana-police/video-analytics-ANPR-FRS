@@ -1,48 +1,52 @@
 import argparse
+import os
 from pathlib import Path
+
+# Must be set BEFORE any PaddlePaddle import chain runs (paddle 2.6 needs the
+# pure-python proto runtime). Applies to both the warmup and --no-warmup paths.
+os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
+
 from api import create_app
 from core.engine import engine
 
 HERE = Path(__file__).resolve().parent
 
 def main():
-    p = argparse.ArgumentParser(description="traffic-plates ANPR + live dashboard")
+    p = argparse.ArgumentParser(description="Video Analytics ANPR FRS — ANPR + live dashboard")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8766)
     p.add_argument("--no-warmup", action="store_true",
-                   help="Skip loading models at startup (loads on first request)")
-    p.add_argument("--sample-videos-dir", default=r"C:\Users\harsh\Downloads\cctv samples",
-                   help="Directory of local sample videos exposed to the live UI")
+                   help="Skip the full YOLO warmup. Awiros OCR is still loaded "
+                        "in the main thread (required for PaddlePaddle "
+                        "thread-safety); YOLO models load on first request.")
+    p.add_argument("--sample-videos-dir", default=str(HERE / "sample_videos"),
+                   help="Directory of local sample videos exposed to the live UI "
+                        "(default: <repo>/sample_videos)")
     args = p.parse_args()
 
     app = create_app(sample_videos_dir=args.sample_videos_dir)
 
     print("=" * 60)
-    print(f"Traffic Management System")
+    print(f"Video Analytics ANPR FRS")
     print(f"  YOLO11 plate detector : {HERE / 'yolo11_plate.pt'}")
     print(f"  Awiros OCR            : {HERE / 'awiros_anpr' / 'model.safetensors'}")
     print(f"  Sample videos         : {args.sample_videos_dir}")
     print(f"  Listening on          : http://{args.host}:{args.port}")
     print("=" * 60)
 
+    # Awiros OCR must be LOADED and PRIMED in the main thread either way:
+    # PaddlePaddle's static graph initializes on first inference, and if that
+    # happens inside a Flask request thread the graph state gets corrupted
+    # for subsequent cross-thread calls.
+    from core.live import prime_awiros_benchmark
+    awiros_dir = HERE / "awiros_anpr"
+
     if not args.no_warmup:
         engine.warmup()
+        prime_awiros_benchmark(awiros_dir)
     else:
-        # v4: Even with --no-warmup, we must load Awiros in the MAIN thread
-        # before the Flask dev server starts spawning request threads.
-        # PaddlePaddle's static graph is initialized on first inference —
-        # if that first call happens inside a Flask request thread, the
-        # graph's CompatMetaTensor state gets corrupted for all subsequent
-        # cross-thread calls. Loading + running one inference here in the
-        # main thread primes the graph correctly.
-        import os
-        os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
         print("[startup] Pre-loading Awiros OCR in main thread (PaddlePaddle thread-safety)…")
         engine._ensure_awiros()
-        # v4: Prime the benchmark measurement now (in the main thread) so
-        # /api/live/benchmark can return real numbers from any request thread.
-        from core.live import prime_awiros_benchmark
-        awiros_dir = HERE / "awiros_anpr"
         prime_awiros_benchmark(awiros_dir)
         print("[startup] Awiros OCR primed ✓")
 

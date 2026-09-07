@@ -1,5 +1,5 @@
 """
-Benchmark the traffic-plates ANPR pipeline components on 50 sampled frames from
+Benchmark the Video Analytics ANPR FRS pipeline components on 50 sampled frames from
 a CCTV video. Reports per-stage timing for:
 
   * Object detection  (COCO YOLO11 variants: n, s, m)            -> ms/frame
@@ -278,9 +278,9 @@ def main():
     lines = []
     def add(s=""): lines.append(s)
     add("=" * 64)
-    add(" TRAFFIC-PLATES PIPELINE BENCHMARK")
+    add(" VIDEO ANALYTICS ANPR FRS PIPELINE BENCHMARK")
     add(f" Device        : {summary['device']}")
-    add(f" Frames        : {summary['n_frames']}  (from app/benchmarks/frames_50/)")
+    add(f" Frames        : {summary['n_frames']}  (from benchmarks/frames_50/)")
     add(f" Image size    : {summary['image_size']}x{summary['image_size']}")
     add("=" * 64)
 

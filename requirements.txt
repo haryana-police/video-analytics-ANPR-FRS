@@ -1,8 +1,27 @@
+# Web
 flask>=3.0
+
+# Detection / tracking (ultralytics pulls torch; openvino is optional —
+# auto-detected at startup for Intel GPU accel, CPU/PyTorch fallback otherwise)
 ultralytics>=8.0
+openvino>=2024.0
+
+# Imaging
 opencv-python>=4.8
 numpy>=1.24,<2.4
 Pillow
+
+# Awiros ANPR-OCR runtime.
+# NOTE: the `paddleocr` pip package is NOT used — the app imports the vendored
+# `ppocr` package from awiros_anpr/PaddleOCR directly (see detect_yolo11_awiros_ocr.py).
 paddlepaddle>=2.6,<3.0
-paddleocr>=2.7,<3.0
-pytesseract>=0.3.10
+protobuf<3.21            # paddle 2.6 needs the pure-python proto runtime; also set via env in run.py
+safetensors              # loads awiros_anpr/model.safetensors
+
+# Runtime deps of the vendored ppocr package (imported eagerly via
+# ppocr.modeling.architectures + ppocr.postprocess)
+tqdm
+pyclipper
+shapely
+scipy
+scikit-image

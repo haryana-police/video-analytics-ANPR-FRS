@@ -3,235 +3,305 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Traffic Management System — Police ANPR Dashboard</title>
+    <title>Video Analytics ANPR FRS — Police ANPR Dashboard</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="/static/style.css">
-    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E🚦%3C/text%3E%3C/svg%3E">
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230c1016'/%3E%3Cpath d='M16 5l9 3v7c0 6-4 10-9 12-5-2-9-6-9-12V8l9-3z' fill='none' stroke='%23f59e0b' stroke-width='2'/%3E%3Ccircle cx='16' cy='14' r='3.5' fill='none' stroke='%2338bdf8' stroke-width='2'/%3E%3Cpath d='M16 17.5v4M13 21h6' stroke='%2338bdf8' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E">
 </head>
 <body>
 
-<!-- ============================================================ -->
-<!-- MODE TOGGLE (Live / Upload)                                  -->
-<!-- ============================================================ -->
-<section class="mode-bar glass">
-    <div class="mode-toggle">
-        <button class="mode-btn active" data-mode="live">
-            <span class="mode-emoji">📡</span>
-            <span class="mode-label">Live mode</span>
-            <span class="mode-sub">MJPEG stream · sample CCTV loop</span>
-        </button>
-        <button class="mode-btn" data-mode="upload">
-            <span class="mode-emoji">📁</span>
-            <span class="mode-label">Upload mode</span>
-            <span class="mode-sub">image or video · persistent audit trail</span>
-        </button>
-    </div>
-</section>
+<!-- ============================================================
+     SVG ICON SPRITE — single source for all UI icons
+============================================================ -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+    <defs>
+        <symbol id="i-logo" viewBox="0 0 24 24"><path d="M12 2l8 2.6V11c0 5.2-3.4 8.8-8 10.9C7.4 19.8 4 16.2 4 11V4.6L12 2z"/><circle cx="12" cy="10.5" r="2.6"/><path d="M12 13.1v3.4M9.8 16.5h4.4"/></symbol>
+        <symbol id="i-live" viewBox="0 0 24 24"><circle cx="12" cy="12" r="2.2"/><path d="M7.7 16.3a6 6 0 010-8.6M16.3 7.7a6 6 0 010 8.6M4.9 19.1a10 10 0 010-14.2M19.1 4.9a10 10 0 010 14.2"/></symbol>
+        <symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 15V4m0 0L7.5 8.5M12 4l4.5 4.5"/><path d="M4 15v3a2 2 0 002 2h12a2 2 0 002-2v-3"/></symbol>
+        <symbol id="i-bolt" viewBox="0 0 24 24"><path d="M13 2L4.5 13.5H11L9.5 22 19 10h-6.5L13 2z"/></symbol>
+        <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/><rect x="10" y="10" width="4" height="4"/><path d="M9 2v3M15 2v3M9 19v3M15 19v3M2 9h3M2 15h3M19 9h3M19 15h3"/></symbol>
+        <symbol id="i-text" viewBox="0 0 24 24"><path d="M4 6h16M4 12h10M4 18h13"/><path d="M18 15l3 3-3 3"/></symbol>
+        <symbol id="i-scan" viewBox="0 0 24 24"><path d="M4 8V6a2 2 0 012-2h2M16 4h2a2 2 0 012 2v2M20 16v2a2 2 0 01-2 2h-2M8 20H6a2 2 0 01-2-2v-2"/><path d="M4 12h16"/></symbol>
+        <symbol id="i-cam" viewBox="0 0 24 24"><rect x="3" y="7" width="13" height="10" rx="2"/><path d="M16 10.5l5-3v9l-5-3"/></symbol>
+        <symbol id="i-play" viewBox="0 0 24 24"><path d="M7 4.5l13 7.5-13 7.5v-15z"/></symbol>
+        <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="1.5"/></symbol>
+        <symbol id="i-pause" viewBox="0 0 24 24"><path d="M8 5v14M16 5v14" stroke-linecap="round" stroke-width="2.4"/></symbol>
+        <symbol id="i-chev" viewBox="0 0 24 24"><path d="M9 5l7 7-7 7" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+        <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 12a8 8 0 10-2.3 5.7M20 12V7m0 5h-5" stroke-linecap="round"/></symbol>
+        <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18" stroke-linecap="round"/></symbol>
+        <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2 12s3.5-6.5 10-6.5S22 12 22 12s-3.5 6.5-10 6.5S2 12 2 12z"/><circle cx="12" cy="12" r="2.8"/></symbol>
+        <symbol id="i-boxes" viewBox="0 0 24 24"><rect x="4" y="4" width="10" height="8" rx="1"/><rect x="10" y="12" width="10" height="8" rx="1"/></symbol>
+        <symbol id="i-plate" viewBox="0 0 24 24"><rect x="3" y="8" width="18" height="8" rx="1.5"/><path d="M6.5 11v2M9.5 11v2M12 11v2M14.5 11v2M17.5 11v2" stroke-linecap="round"/></symbol>
+        <symbol id="i-route" viewBox="0 0 24 24"><circle cx="5" cy="19" r="2"/><circle cx="19" cy="5" r="2"/><path d="M7 19h8a4 4 0 004-4V7" stroke-dasharray="3.5 2.5"/></symbol>
+        <symbol id="i-layers" viewBox="0 0 24 24"><path d="M12 3l9 5-9 5-9-5 9-5z"/><path d="M3 13l9 5 9-5"/></symbol>
+        <symbol id="i-car" viewBox="0 0 24 24"><path d="M5 13l1.5-4.5A2 2 0 018.4 7h7.2a2 2 0 011.9 1.5L19 13"/><rect x="4" y="13" width="16" height="5" rx="1.5"/><path d="M7 18v2M17 18v2M7.5 15.5h.01M16.5 15.5h.01" stroke-linecap="round"/></symbol>
+        <symbol id="i-person" viewBox="0 0 24 24"><circle cx="12" cy="7.5" r="3.2"/><path d="M5.5 20a6.5 6.5 0 0113 0"/></symbol>
+        <symbol id="i-terminal" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M12.5 15H17" stroke-linecap="round"/></symbol>
+        <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="1.8"/><path d="M4 18l5-5 3.5 3.5L16 13l4 4.5"/></symbol>
+        <symbol id="i-film" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 4v16M17 4v16M3 9h4M3 15h4M17 9h4M17 15h4"/></symbol>
+        <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6"/><path d="M15.5 15.5L21 21" stroke-linecap="round"/></symbol>
+        <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v11m0 0l-4-4m4 4l4-4"/><path d="M4 19h16" stroke-linecap="round"/></symbol>
+        <symbol id="i-check" viewBox="0 0 24 24"><path d="M4.5 12.5l5 5L19.5 7" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+        <symbol id="i-alert" viewBox="0 0 24 24"><path d="M12 3L2.5 20h19L12 3z"/><path d="M12 10v4m0 3v.01" stroke-linecap="round"/></symbol>
+        <symbol id="i-gauge" viewBox="0 0 24 24"><path d="M4 14a8 8 0 1116 0"/><path d="M12 14l3.5-3.5" stroke-linecap="round"/><path d="M2.5 19h19" stroke-linecap="round"/></symbol>
+        <symbol id="i-link" viewBox="0 0 24 24"><path d="M9 12h6" stroke-linecap="round"/><path d="M8.5 15.5l-2 2a3.5 3.5 0 01-5-5l3-3a3.5 3.5 0 015 0" transform="translate(3 3)"/><path d="M15.5 8.5l2-2a3.5 3.5 0 015 5l-3 3a3.5 3.5 0 01-5 0" transform="translate(-3 -3)"/></symbol>
+        <symbol id="i-doc" viewBox="0 0 24 24"><path d="M6 3h8l4 4v14H6V3z"/><path d="M14 3v4h4M9 12h6M9 16h6" stroke-linecap="round"/></symbol>
+    </defs>
+</svg>
 
-<!-- ============================================================ -->
-<!-- TOP COMMAND BAR                                              -->
-<!-- ============================================================ -->
+<!-- ============================================================
+     TOP BAR — brand · mode switch · pipeline status
+============================================================ -->
 <header class="topbar">
     <div class="brand">
-        <span class="logo">🚦</span>
-        <div>
-            <h1>Traffic Management System</h1>
-            <p class="tagline">Police ANPR · Verifiable Pipeline · Object Detection · Plate OCR · Multi-Object Tracking</p>
+        <span class="logo" aria-hidden="true"><svg class="ic ic-logo"><use href="#i-logo"/></svg></span>
+        <div class="brand-text">
+            <h1>Video Analytics <b>ANPR·FRS</b></h1>
+            <p class="tagline">Verifiable pipeline inspector — detection · tracking · plate OCR</p>
         </div>
     </div>
+
+    <nav class="mode-toggle" aria-label="Mode">
+        <button class="mode-btn active" data-mode="live" type="button">
+            <svg class="ic"><use href="#i-live"/></svg>
+            <span>Live</span>
+        </button>
+        <button class="mode-btn" data-mode="upload" type="button">
+            <svg class="ic"><use href="#i-upload"/></svg>
+            <span>Upload</span>
+        </button>
+    </nav>
+
     <div class="topbar-right">
-        <div class="health-pill" id="health-pill" title="Pipeline status">
+        <span class="chip chip-mono" id="device-chip" title="Compute device used by the YOLO models">
+            <svg class="ic"><use href="#i-cpu"/></svg><span id="device-text">—</span>
+        </span>
+        <span class="health-pill" id="health-pill" title="Pipeline status">
             <span class="dot" id="health-dot"></span>
             <span id="health-text">connecting…</span>
-        </div>
-        <button class="btn-ghost" id="btn-benchmark" type="button" title="Benchmark all YOLO11 variants on this machine">
-            ⚡ Benchmark
+        </span>
+        <button class="btn btn-ghost" id="btn-benchmark" type="button" title="Benchmark all YOLO11 variants on this machine">
+            <svg class="ic"><use href="#i-bolt"/></svg>Benchmark
         </button>
     </div>
 </header>
 
-<!-- ============================================================ -->
-<!-- CONFIG DECK (visible in BOTH modes)                          -->
-<!-- Model pickers + OCR strategy                                 -->
-<!-- ============================================================ -->
-<section class="control-deck glass" id="config-deck">
-    <div class="deck-block">
-        <label class="deck-label">🧠 Models</label>
-        <div class="deck-row">
-            <label class="opt-mini">COCO detector
-                <select id="model-coco" class="opt-select-mini">
-                    <option value="yolo11n" selected>YOLO11 Nano (~150ms/frame CPU)</option>
-                    <option value="yolo11s">YOLO11 Small (~260ms)</option>
-                    <option value="yolo11m">YOLO11 Medium (~600ms, GPU)</option>
-                    <option value="yolo11l">YOLO11 Large (GPU)</option>
-                </select>
-            </label>
-            <label class="opt-mini">Plate detector
-                <select id="model-plate" class="opt-select-mini">
-                    <option value="yolo11_plate" selected>YOLO11 Plate Nano (local)</option>
-                    <option value="yolo11s_plate">YOLO11 Plate Small (HF auto)</option>
-                    <option value="yolo11m_plate">YOLO11 Plate Medium (HF auto)</option>
-                    <option value="yolo11l_plate">YOLO11 Plate Large (HF auto)</option>
-                </select>
-            </label>
-            <label class="opt-mini">OCR strategy
-                <select id="ocr-strategy" class="opt-select-mini">
-                    <option value="best" selected>On best-crop only (recommended)</option>
-                    <option value="every">Every plate (slow)</option>
-                </select>
-            </label>
-        </div>
+<!-- ============================================================
+     CONFIG DECK — model pickers + OCR strategy (both modes)
+============================================================ -->
+<section class="control-deck" id="config-deck" aria-label="Pipeline configuration">
+    <div class="deck-group">
+        <label class="deck-label" for="model-coco">
+            <svg class="ic"><use href="#i-cpu"/></svg>COCO detector
+        </label>
+        <select id="model-coco" class="field">
+            <option value="yolo11n" selected>yolo11n — nano (~150 ms/frame CPU)</option>
+            <option value="yolo11s">yolo11s — small (~260 ms)</option>
+            <option value="yolo11m">yolo11m — medium (GPU advised)</option>
+            <option value="yolo11l">yolo11l — large (GPU)</option>
+        </select>
+    </div>
+    <div class="deck-group">
+        <label class="deck-label" for="model-plate">
+            <svg class="ic"><use href="#i-plate"/></svg>Plate detector
+        </label>
+        <select id="model-plate" class="field">
+            <option value="yolo11_plate" selected>yolo11_plate — nano (local weights)</option>
+            <option value="yolo11s_plate">yolo11s_plate — small (HF auto-download)</option>
+            <option value="yolo11m_plate">yolo11m_plate — medium (HF auto-download)</option>
+            <option value="yolo11l_plate">yolo11l_plate — large (HF auto-download)</option>
+        </select>
+    </div>
+    <div class="deck-group">
+        <label class="deck-label" for="ocr-strategy">
+            <svg class="ic"><use href="#i-text"/></svg>OCR strategy
+        </label>
+        <select id="ocr-strategy" class="field">
+            <option value="best" selected>Best crop only — one read per track (fast)</option>
+            <option value="every">Every frame — highest-conf read wins (slow)</option>
+        </select>
+    </div>
+    <div class="deck-group">
+        <label class="deck-label" for="crop-algo">
+            <svg class="ic"><use href="#i-scan"/></svg>Best-crop criterion
+        </label>
+        <select id="crop-algo" class="field">
+            <option value="area" selected>Largest bbox area</option>
+            <option value="sharpness">Sharpest crop (Laplacian)</option>
+        </select>
     </div>
 </section>
 
-<!-- ============================================================ -->
-<!-- LIVE PANEL (visible only in live mode)                       -->
-<!-- Source picker + start/stop + live viewport + results        -->
-<!-- ============================================================ -->
-<section id="live-panel" class="live-panel">
-    <section class="control-deck glass" id="live-source-deck">
-        <div class="deck-block">
-            <label class="deck-label">📺 Live source</label>
-            <div class="deck-row">
-                <select id="source-select" class="opt-select" aria-label="Live source"></select>
-                <input type="text" id="source-url" class="opt-input" placeholder="…or paste RTSP/HTTP URL or '0' for webcam" />
-                <button id="btn-refresh-sources" class="btn-ghost" type="button" title="Refresh source list">↻</button>
+<!-- ============================================================
+     LIVE PANEL
+============================================================ -->
+<section id="live-panel" class="panel">
+
+    <!-- Source deck -->
+    <section class="source-deck" aria-label="Live source">
+        <div class="deck-group grow">
+            <label class="deck-label" for="source-select">
+                <svg class="ic"><use href="#i-cam"/></svg>Source
+            </label>
+            <div class="source-row">
+                <select id="source-select" class="field" aria-label="Sample source"></select>
+                <input type="text" id="source-url" class="field" placeholder="…or RTSP / HTTP URL · '0' = webcam" spellcheck="false"/>
+                <button id="btn-refresh-sources" class="btn btn-icon" type="button" title="Refresh source list">
+                    <svg class="ic"><use href="#i-refresh"/></svg>
+                </button>
             </div>
-            <div class="deck-row">
-                <label class="opt-mini">Target FPS
-                    <input type="number" id="target-fps" class="opt-input-mini" min="1" max="30" value="15" />
-                </label>
-                <label class="opt-mini">Loop
-                    <input type="checkbox" id="loop-toggle" checked />
-                </label>
-                <button id="btn-start" class="btn-primary">▶ Start Live</button>
-                <button id="btn-stop" class="btn-danger" disabled>■ Stop</button>
-            </div>
+        </div>
+        <div class="deck-group tight">
+            <label class="deck-label" for="target-fps"
+                   title="Rate at which source frames are fed into the detector pipeline (source read pacing). The actual processing rate is shown live as 'fps' on the viewport.">
+                <svg class="ic"><use href="#i-gauge"/></svg>Target FPS
+            </label>
+            <input type="number" id="target-fps" class="field field-xs" min="1" max="30" value="15"
+                   title="Source feed rate cap — how many frames per second are pulled from the video/camera into detection. Actual processed fps is displayed on the viewport."/>
+        </div>
+        <div class="deck-group tight">
+            <label class="deck-label" for="loop-toggle">Loop</label>
+            <label class="switch">
+                <input type="checkbox" id="loop-toggle" checked/>
+                <span class="switch-track"></span>
+            </label>
+        </div>
+        <div class="deck-actions">
+            <button id="btn-start" class="btn btn-primary" type="button">
+                <svg class="ic"><use href="#i-play"/></svg>Start live
+            </button>
+            <button id="btn-pause" class="btn btn-ghost" type="button" disabled title="Freeze processing — the viewport holds its last frame">
+                <svg class="ic"><use href="#i-pause"/></svg><span id="btn-pause-label">Pause</span>
+            </button>
+            <button id="btn-stop" class="btn btn-danger" type="button" disabled>
+                <svg class="ic"><use href="#i-stop"/></svg>Stop
+            </button>
         </div>
     </section>
 
+    <!-- Viewport + results -->
     <main class="main-grid">
-        <section class="viewport-panel glass">
+        <section class="card viewport-card">
             <div class="viewport-header">
-                <h3>Live viewport <span class="hint-inline">(clickable canvas · verifiable pipeline)</span></h3>
+                <h3 class="card-title">
+                    <svg class="ic"><use href="#i-eye"/></svg>Viewport
+                    <span class="hint-inline">every stage renders independently · click any box</span>
+                </h3>
                 <div class="viewport-meta">
-                    <span class="meta-chip" id="meta-fps">fps —</span>
-                    <span class="meta-chip" id="meta-frame">frame —</span>
-                    <span class="meta-chip" id="meta-size">— × —</span>
-                    <span class="meta-chip" id="meta-session">no session</span>
+                    <span class="meta-chip mono" id="meta-fps">fps —</span>
+                    <span class="meta-chip mono" id="meta-frame">frame —</span>
+                    <span class="meta-chip mono" id="meta-size">— × —</span>
+                    <span class="meta-chip mono accent" id="meta-session">no session</span>
                 </div>
             </div>
 
-            <!-- v4: Pipeline stage tabs — each stage renders independently on canvas -->
-            <div class="stage-tabs" id="stage-tabs" role="tablist">
-                <button class="stage-tab active" data-stage="raw" role="tab">
-                    <span class="stage-num">1</span>
-                    <span class="stage-lbl">Raw</span>
-                    <span class="stage-sub">original frame</span>
+            <div class="stream-alert hidden" id="stream-alert" role="alert">
+                <svg class="ic"><use href="#i-alert"/></svg>
+                <span id="stream-alert-text"></span>
+            </div>
+
+            <!-- Pipeline stage stepper -->
+            <div class="stage-tabs" id="stage-tabs" role="tablist" aria-label="Pipeline stages">
+                <button class="stage-tab active" data-stage="raw" role="tab" aria-selected="true" type="button">
+                    <span class="stage-num">01</span>
+                    <svg class="ic"><use href="#i-eye"/></svg>
+                    <span class="stage-txt"><b>Raw</b><small>original frame</small></span>
                 </button>
-                <button class="stage-tab" data-stage="objects" role="tab">
-                    <span class="stage-num">2</span>
-                    <span class="stage-lbl">Objects</span>
-                    <span class="stage-sub">YOLO COCO</span>
+                <button class="stage-tab" data-stage="objects" role="tab" aria-selected="false" type="button">
+                    <span class="stage-num">02</span>
+                    <svg class="ic"><use href="#i-boxes"/></svg>
+                    <span class="stage-txt"><b>Objects</b><small>yolo coco</small></span>
                 </button>
-                <button class="stage-tab" data-stage="plates" role="tab">
-                    <span class="stage-num">3</span>
-                    <span class="stage-lbl">Plates</span>
-                    <span class="stage-sub">YOLO plate</span>
+                <button class="stage-tab" data-stage="plates" role="tab" aria-selected="false" type="button">
+                    <span class="stage-num">03</span>
+                    <svg class="ic"><use href="#i-plate"/></svg>
+                    <span class="stage-txt"><b>Plates</b><small>yolo plate</small></span>
                 </button>
-                <button class="stage-tab" data-stage="ocr" role="tab">
-                    <span class="stage-num">4</span>
-                    <span class="stage-lbl">OCR</span>
-                    <span class="stage-sub">Awiros ANPR</span>
+                <button class="stage-tab" data-stage="ocr" role="tab" aria-selected="false" type="button">
+                    <span class="stage-num">04</span>
+                    <svg class="ic"><use href="#i-text"/></svg>
+                    <span class="stage-txt"><b>OCR</b><small>awiros anpr</small></span>
                 </button>
-                <button class="stage-tab" data-stage="tracking" role="tab">
-                    <span class="stage-num">5</span>
-                    <span class="stage-lbl">Tracking</span>
-                    <span class="stage-sub">ByteTrack</span>
+                <button class="stage-tab" data-stage="tracking" role="tab" aria-selected="false" type="button">
+                    <span class="stage-num">05</span>
+                    <svg class="ic"><use href="#i-route"/></svg>
+                    <span class="stage-txt"><b>Tracking</b><small>bytetrack</small></span>
                 </button>
-                <button class="stage-tab" data-stage="all" role="tab">
+                <button class="stage-tab" data-stage="all" role="tab" aria-selected="false" type="button">
                     <span class="stage-num">⊕</span>
-                    <span class="stage-lbl">All</span>
-                    <span class="stage-sub">combined</span>
+                    <svg class="ic"><use href="#i-layers"/></svg>
+                    <span class="stage-txt"><b>All</b><small>combined</small></span>
                 </button>
             </div>
 
             <div class="media-viewport" id="media-viewport">
-                <!-- v4: Canvas replaces <img> — we draw raw MJPEG frame + annotations -->
                 <canvas id="live-canvas" class="viewport-media"></canvas>
                 <div id="viewport-overlay-empty" class="viewport-empty">
-                    <div class="empty-icon">📡</div>
+                    <svg class="ic empty-icon"><use href="#i-cam"/></svg>
                     <h2>No live stream</h2>
-                    <p>Pick a source above and click <b>Start Live</b>.</p>
-                    <p class="hint">The canvas will show the raw frame + pipeline annotations per stage.</p>
+                    <p>Pick a source above and press <b>Start live</b>.</p>
+                    <p class="hint">Raw MJPEG frames are drawn here; detections arrive over SSE<br>and are rendered per stage on this clickable canvas.</p>
                 </div>
             </div>
 
-            <!-- v4: Per-component timing bar -->
-            <div class="timing-bar" id="timing-bar">
-                <div class="timing-segment" data-comp="coco">
-                    <span class="timing-label">COCO</span>
-                    <span class="timing-value" id="timing-coco">— ms</span>
+            <!-- Per-component timing -->
+            <div class="timing-bar" id="timing-bar" aria-label="Per-component latency">
+                <div class="timing-bars">
+                    <div class="tseg seg-coco" id="fill-coco" title="COCO detection ms"></div>
+                    <div class="tseg seg-plate" id="fill-plate" title="Plate detection ms"></div>
+                    <div class="tseg seg-ocr" id="fill-ocr" title="OCR ms"></div>
                 </div>
-                <div class="timing-segment" data-comp="plate">
-                    <span class="timing-label">Plate</span>
-                    <span class="timing-value" id="timing-plate">— ms</span>
-                </div>
-                <div class="timing-segment" data-comp="ocr">
-                    <span class="timing-label">OCR</span>
-                    <span class="timing-value" id="timing-ocr">— ms</span>
-                </div>
-                <div class="timing-segment total" data-comp="total">
-                    <span class="timing-label">Total</span>
-                    <span class="timing-value" id="timing-total">— ms</span>
-                </div>
-                <div class="timing-segment" data-comp="ocr-fired">
-                    <span class="timing-label">OCR fired</span>
-                    <span class="timing-value" id="timing-ocr-fired">—</span>
+                <div class="timing-readout mono">
+                    <span class="tl tl-coco">COCO <b id="timing-coco">—</b></span>
+                    <span class="tl tl-plate">Plate <b id="timing-plate">—</b></span>
+                    <span class="tl tl-ocr">OCR <b id="timing-ocr">—</b></span>
+                    <span class="tl">Total <b id="timing-total">—</b></span>
+                    <span class="tl">OCR fired <b id="timing-ocr-fired">—</b></span>
                 </div>
             </div>
         </section>
 
-        <aside class="results-panel glass">
+        <!-- Results sidebar -->
+        <aside class="card results-panel">
             <div class="results-summary">
-                <div class="summary-card">
-                    <div class="summary-num" id="sum-vehicles">0</div>
-                    <div class="summary-label">Vehicles</div>
+                <div class="stat">
+                    <div class="stat-num" id="sum-vehicles">0</div>
+                    <div class="stat-lbl">Vehicles</div>
                 </div>
-                <div class="summary-card success">
-                    <div class="summary-num" id="sum-valid-plates">0</div>
-                    <div class="summary-label">Valid plates</div>
+                <div class="stat stat-ok">
+                    <div class="stat-num" id="sum-valid-plates">0</div>
+                    <div class="stat-lbl">Valid plates</div>
                 </div>
-                <div class="summary-card">
-                    <div class="summary-num" id="sum-plates">0</div>
-                    <div class="summary-label">Total plates</div>
+                <div class="stat">
+                    <div class="stat-num" id="sum-plates">0</div>
+                    <div class="stat-lbl">Total plates</div>
                 </div>
-                <div class="summary-card warn">
-                    <div class="summary-num" id="sum-persons">0</div>
-                    <div class="summary-label">Persons</div>
+                <div class="stat stat-warn">
+                    <div class="stat-num" id="sum-persons">0</div>
+                    <div class="stat-lbl">Persons</div>
                 </div>
             </div>
 
-            <div class="results-tabs" role="tablist">
-                <button class="results-tab active" data-tab="vehicles" role="tab">
-                    🚗 Vehicles <span class="tab-count" id="tab-count-vehicles">0</span>
+            <div class="results-tabs" role="tablist" aria-label="Result categories">
+                <button class="results-tab active" data-tab="vehicles" role="tab" aria-selected="true" type="button">
+                    <svg class="ic"><use href="#i-car"/></svg>Vehicles<span class="tab-count mono" id="tab-count-vehicles">0</span>
                 </button>
-                <button class="results-tab" data-tab="plates" role="tab">
-                    🔢 Plates <span class="tab-count" id="tab-count-plates">0</span>
+                <button class="results-tab" data-tab="plates" role="tab" aria-selected="false" type="button">
+                    <svg class="ic"><use href="#i-plate"/></svg>Plates<span class="tab-count mono" id="tab-count-plates">0</span>
                 </button>
-                <button class="results-tab" data-tab="persons" role="tab">
-                    🚶 Persons <span class="tab-count" id="tab-count-persons">0</span>
+                <button class="results-tab" data-tab="persons" role="tab" aria-selected="false" type="button">
+                    <svg class="ic"><use href="#i-person"/></svg>Persons<span class="tab-count mono" id="tab-count-persons">0</span>
                 </button>
-                <button class="results-tab" data-tab="console" role="tab">
-                    📋 Console
+                <button class="results-tab" data-tab="console" role="tab" aria-selected="false" type="button" title="Event console">
+                    <svg class="ic"><use href="#i-terminal"/></svg>
                 </button>
             </div>
 
             <div class="results-content active" data-tab="vehicles" id="panel-vehicles">
                 <div id="vehicles-list" class="cards-stack">
-                    <p class="empty">No vehicles tracked yet. Start a live stream.</p>
+                    <p class="empty">No vehicles tracked yet.</p>
                 </div>
             </div>
             <div class="results-content" data-tab="plates" id="panel-plates">
@@ -245,189 +315,201 @@
                 </div>
             </div>
             <div class="results-content" data-tab="console" id="panel-console">
-                <div id="console-log" class="console-log"></div>
+                <div id="console-log" class="console-log mono"></div>
             </div>
         </aside>
     </main>
 </section>
 
-<!-- ============================================================ -->
-<!-- UPLOAD PANEL (visible only in upload mode)                  -->
-<!-- ============================================================ -->
-<section id="upload-panel" class="upload-panel hidden">
+<!-- ============================================================
+     UPLOAD PANEL
+============================================================ -->
+<section id="upload-panel" class="panel hidden">
 
-    <div class="upload-tabs glass" role="tablist">
-        <button class="upload-tab active" data-upload-tab="image" role="tab">
-            📸 Image
+    <div class="upload-tabs" role="tablist" aria-label="Upload type">
+        <button class="upload-tab active" data-upload-tab="image" role="tab" aria-selected="true" type="button">
+            <svg class="ic"><use href="#i-image"/></svg>Image
         </button>
-        <button class="upload-tab" data-upload-tab="video" role="tab">
-            🎬 Video
+        <button class="upload-tab" data-upload-tab="video" role="tab" aria-selected="false" type="button">
+            <svg class="ic"><use href="#i-film"/></svg>Video
         </button>
     </div>
 
     <div class="upload-grid">
-        <section class="upload-card glass" data-upload-tab-pane="image">
+        <section class="card upload-card" data-upload-tab-pane="image">
             <div id="image-dropzone" class="dropzone">
                 <input type="file" id="image-file-input" accept="image/*" hidden>
                 <div class="dropzone-content" id="image-dropzone-content">
-                    <div class="upload-icon">📸</div>
+                    <svg class="ic dz-icon"><use href="#i-image"/></svg>
                     <h2>Drop a traffic photo here</h2>
                     <p>or <span class="link">click to browse</span></p>
                     <p class="hint">JPG · PNG · WEBP · BMP</p>
                 </div>
                 <img id="image-preview" class="preview hidden" alt="preview">
-                <button id="image-change-btn" class="btn-ghost hidden" type="button">↻ Choose different image</button>
+                <button id="image-change-btn" class="btn btn-ghost hidden" type="button">
+                    <svg class="ic"><use href="#i-refresh"/></svg>Choose different image
+                </button>
             </div>
             <div class="upload-actions">
-                <button id="image-detect-btn" class="btn-primary" disabled>
-                    <span class="btn-icon">🔍</span>
-                    <span class="btn-label">Run image analysis</span>
+                <button id="image-detect-btn" class="btn btn-primary" disabled>
+                    <svg class="ic"><use href="#i-search"/></svg><span class="btn-label">Run image analysis</span>
                 </button>
-                <button id="image-clear-btn" class="btn-ghost" disabled>Clear</button>
+                <button id="image-clear-btn" class="btn btn-ghost" disabled>Clear</button>
             </div>
         </section>
 
-        <section class="upload-card hidden" data-upload-tab-pane="video">
+        <section class="card upload-card hidden" data-upload-tab-pane="video">
             <div id="video-dropzone" class="dropzone">
                 <input type="file" id="video-file-input" accept="video/*" hidden>
                 <div class="dropzone-content" id="video-dropzone-content">
-                    <div class="upload-icon">🎬</div>
+                    <svg class="ic dz-icon"><use href="#i-film"/></svg>
                     <h2>Drop a traffic video here</h2>
                     <p>or <span class="link">click to browse</span></p>
-                    <p class="hint">MP4 · MOV · AVI · WEBM (up to 500 MB)</p>
+                    <p class="hint">MP4 · MOV · AVI · WEBM — up to 500 MB</p>
                 </div>
                 <video id="video-preview" class="preview hidden" controls muted></video>
-                <button id="video-change-btn" class="btn-ghost hidden" type="button">↻ Choose different video</button>
+                <button id="video-change-btn" class="btn btn-ghost hidden" type="button">
+                    <svg class="ic"><use href="#i-refresh"/></svg>Choose different video
+                </button>
             </div>
             <div class="upload-options">
                 <label class="opt-mini">Frame stride
-                    <input type="number" id="upload-frame-stride" class="opt-input-mini" min="1" max="10" value="2" />
+                    <input type="number" id="upload-frame-stride" class="field field-xs" min="1" max="10" value="2"/>
                 </label>
                 <label class="opt-mini">Max frames
-                    <input type="number" id="upload-max-frames" class="opt-input-mini" min="0" placeholder="(entire)" />
+                    <input type="number" id="upload-max-frames" class="field field-xs" min="1" placeholder="(entire)"/>
                 </label>
                 <label class="opt-mini">Write annotated video
-                    <input type="checkbox" id="upload-write-video" checked />
+                    <input type="checkbox" id="upload-write-video" checked/>
                 </label>
             </div>
             <div class="upload-actions">
-                <button id="video-detect-btn" class="btn-primary" disabled>
-                    <span class="btn-icon">🎬</span>
-                    <span class="btn-label">Run video tracking</span>
+                <button id="video-detect-btn" class="btn btn-primary" disabled>
+                    <svg class="ic"><use href="#i-play"/></svg><span class="btn-label">Run video tracking</span>
                 </button>
-                <button id="video-stop-btn" class="btn-danger" disabled>■ Stop</button>
-                <button id="video-clear-btn" class="btn-ghost" disabled>Clear</button>
+                <button id="video-stop-btn" class="btn btn-danger" disabled>
+                    <svg class="ic"><use href="#i-stop"/></svg>Stop
+                </button>
+                <button id="video-clear-btn" class="btn btn-ghost" disabled>Clear</button>
             </div>
         </section>
 
-        <aside class="upload-results glass" id="upload-results-pane">
+        <aside class="card upload-results" id="upload-results-pane">
             <div class="upload-results-header">
                 <h3 id="upload-results-title">Results</h3>
-                <button id="upload-results-clear" class="btn-ghost hidden">Clear</button>
+                <button id="upload-results-clear" class="btn btn-ghost hidden">Clear</button>
             </div>
             <div id="upload-results-empty" class="upload-empty">
-                <p>Upload an image or video and click Run to see results here.</p>
-                <p class="hint">Results include annotated images / videos, plate OCR text, and per-track audit trails.</p>
+                <svg class="ic dz-icon dim"><use href="#i-doc"/></svg>
+                <p>Run an analysis to see verifiable results here —<br>annotated media, plate OCR, and per-track audit trails.</p>
             </div>
             <div id="upload-results-body" class="hidden"></div>
         </aside>
     </div>
 </section>
 
-<!-- ============================================================ -->
-<!-- BENCHMARK PANEL (modal-like, hidden by default)             -->
-<!-- ============================================================ -->
-<section class="benchmark-panel glass hidden" id="benchmark-panel">
-    <div class="benchmark-header">
-        <h3>⚡ YOLO11 benchmark — measured on this machine</h3>
-        <button class="btn-ghost" id="btn-benchmark-close" type="button">✕ Close</button>
-    </div>
-    <div class="benchmark-body">
-        <p class="hint">Times in milliseconds per frame on a 1280×720 sample frame. Lower = better. Use this to decide which variant is fast enough for live streams.</p>
-        <table class="benchmark-table" id="benchmark-table">
-            <thead>
-                <tr>
-                    <th>Model</th>
-                    <th>Kind</th>
-                    <th>min</th>
-                    <th>median</th>
-                    <th>mean</th>
-                    <th>max</th>
-                    <th>max fps</th>
-                    <th>verdict</th>
-                </tr>
-            </thead>
-            <tbody id="benchmark-tbody">
-                <tr><td colspan="8" class="empty">Click "Run benchmark" to measure all variants.</td></tr>
-            </tbody>
-        </table>
-        <button class="btn-primary" id="btn-benchmark-run" type="button">▶ Run benchmark</button>
-    </div>
-</section>
+<!-- ============================================================
+     BENCHMARK MODAL
+============================================================ -->
+<div class="modal-backdrop hidden" id="benchmark-backdrop">
+    <section class="card modal benchmark-modal" role="dialog" aria-modal="true" aria-labelledby="benchmark-title">
+        <div class="modal-head">
+            <h3 id="benchmark-title"><svg class="ic"><use href="#i-bolt"/></svg>YOLO11 benchmark — measured on this machine</h3>
+            <button class="btn btn-icon" id="btn-benchmark-close" type="button" aria-label="Close benchmark">
+                <svg class="ic"><use href="#i-close"/></svg>
+            </button>
+        </div>
+        <div class="benchmark-body">
+            <p class="hint">Milliseconds per frame on a pinned 1280×720 CCTV frame — lower is better. This decides which variant is fast enough for live streams. The exact artifact served at runtime (<span class="mono">*.pt</span> or OpenVINO IR) is what gets measured.</p>
+            <table class="data-table" id="benchmark-table">
+                <thead>
+                    <tr>
+                        <th>Model</th><th>Kind</th><th>min</th><th>median</th><th>mean</th><th>max</th><th>max fps</th><th>verdict</th>
+                    </tr>
+                </thead>
+                <tbody id="benchmark-tbody">
+                    <tr><td colspan="8" class="empty">Press “Run benchmark” to measure all local variants.</td></tr>
+                </tbody>
+            </table>
+            <div class="modal-actions">
+                <button class="btn btn-primary" id="btn-benchmark-run" type="button">
+                    <svg class="ic"><use href="#i-play"/></svg>Run benchmark
+                </button>
+            </div>
+        </div>
+    </section>
+</div>
 
-<!-- ============================================================ -->
-<!-- DETAIL MODAL (plate / vehicle / person inspector)          -->
-<!-- ============================================================ -->
-<div id="detail-modal" class="track-modal hidden" aria-hidden="true" role="dialog" aria-modal="true" aria-labelledby="detail-modal-title">
-    <div class="track-modal-card glass">
-        <div class="track-modal-head">
+<!-- ============================================================
+     TRACK DETAIL MODAL (live sessions)
+============================================================ -->
+<div id="detail-modal" class="modal-backdrop hidden" aria-hidden="true" role="dialog" aria-modal="true" aria-labelledby="detail-modal-title">
+    <section class="card modal detail-modal">
+        <div class="modal-head">
             <div>
-                <h2 id="detail-modal-title">Detection detail</h2>
+                <h3 id="detail-modal-title">Detection detail</h3>
                 <p id="detail-modal-sub" class="hint"></p>
             </div>
-            <button id="detail-modal-close" class="track-modal-close" type="button" aria-label="Close">✕</button>
+            <button id="detail-modal-close" class="btn btn-icon" type="button" aria-label="Close">
+                <svg class="ic"><use href="#i-close"/></svg>
+            </button>
         </div>
 
         <div id="detail-modal-summary" class="detail-summary"></div>
 
-        <div class="track-modal-body">
-            <!-- LEFT: timeline + audit -->
-            <div class="modal-left-pane">
-                <h3>Track timeline</h3>
-                <div id="detail-timeline"></div>
-
-                <h3>Live state <span class="hint-inline">(last seen)</span></h3>
-                <div id="detail-last-seen"></div>
-            </div>
-
-            <!-- RIGHT: best crop + best annotated frame -->
-            <div class="modal-right-pane">
-                <h3>Best crop captured</h3>
-                <div class="modal-images-row">
-                    <div class="img-widget full-w">
-                        <span class="widget-lbl" id="detail-best-crop-label">Best crop (OCR'd at best-bbox frame)</span>
-                        <div class="img-wrap full-frame">
-                            <div id="detail-best-crop" class="placeholder-img">
-                                <p class="empty">No crop available yet.</p>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-
-                <h3>Pipeline metadata</h3>
-                <pre id="detail-meta" class="meta-pre"></pre>
-            </div>
+        <div class="stage-flow-label">
+            <h4 style="margin:14px 20px 0">Pipeline sequence <span class="hint-inline">(everything the system did for this track, in order)</span></h4>
         </div>
-    </div>
+        <div id="detail-stage-flow" class="stage-flow"></div>
+
+        <div class="modal-col-wide">
+            <h4>Details</h4>
+            <div id="detail-last-seen"></div>
+            <h4>Pipeline metadata</h4>
+            <pre id="detail-meta" class="meta-pre mono"></pre>
+        </div>
+    </section>
 </div>
 
-<!-- ============================================================ -->
-<!-- FOOTER                                                       -->
-<!-- ============================================================ -->
+<!-- ============================================================
+     TRACK AUDIT MODAL (uploaded videos — per-frame OCR reads)
+============================================================ -->
+<div id="audit-modal" class="modal-backdrop hidden" aria-hidden="true" role="dialog" aria-modal="true" aria-labelledby="audit-modal-title">
+    <section class="card modal audit-modal">
+        <div class="modal-head">
+            <div>
+                <h3 id="audit-modal-title"><svg class="ic"><use href="#i-doc"/></svg>Track audit</h3>
+                <p id="audit-modal-sub" class="hint"></p>
+            </div>
+            <button id="audit-modal-close" class="btn btn-icon" type="button" aria-label="Close">
+                <svg class="ic"><use href="#i-close"/></svg>
+            </button>
+        </div>
+        <div id="audit-modal-summary" class="detail-summary"></div>
+        <div class="audit-body">
+            <h4>Character voting <span class="hint-inline">(per-position OCR votes → final text)</span></h4>
+            <div id="audit-votes" class="votes-grid mono"></div>
+            <h4>Per-frame reads</h4>
+            <div id="audit-reads" class="reads-list"></div>
+        </div>
+    </section>
+</div>
+
+<!-- ============================================================
+     FOOTER
+============================================================ -->
 <footer class="footer">
     <div class="footer-inner">
-        <div>
-            <p><b>Traffic Management System</b> — Police ANPR &amp; Multi-Object Tracker</p>
-            <p class="tech-list">
-                <span class="badge-pill">YOLO11</span>
-                <span class="badge-pill">Awiros ANPR-OCR</span>
-                <span class="badge-pill">ByteTrack</span>
-                <span class="badge-pill">Flask · MJPEG · SSE · Canvas</span>
-            </p>
+        <div class="tech-list">
+            <span class="badge-pill">YOLO11</span>
+            <span class="badge-pill">Awiros ANPR-OCR</span>
+            <span class="badge-pill">ByteTrack</span>
+            <span class="badge-pill">Flask · MJPEG · SSE · Canvas</span>
         </div>
-        <div class="copyright">
-            <p>Status: <b id="footer-status">ONLINE</b></p>
-            <p>Version: <b>v4.0 (Verifiable Pipeline Inspector)</b></p>
+        <div class="footer-right mono">
+            <span>Status <b id="footer-status">ONLINE</b></span>
+            <span class="sep"></span>
+            <span>v5.1 — Verifiable Pipeline Inspector</span>
         </div>
     </div>
 </footer>

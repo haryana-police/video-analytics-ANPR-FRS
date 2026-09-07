@@ -29,18 +29,33 @@ sys.path.insert(0, str(HERE))
 from core.engine import engine
 
 log = logging.getLogger("anpr_video_awiros")
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
-)
+# Configure root logging only for standalone CLI runs. When imported by the
+# Flask app, defer to whatever the app/entry point has configured instead of
+# hijacking root logging at import time.
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
 
 # ---------------------------------------------------------------------------
 # Tunables
 # ---------------------------------------------------------------------------
 IMGSZ = 640
 DET_CONF = 0.25          # YOLO plate detection confidence threshold
-OCR_MIN_HEIGHT = 18       # Awiros on crops below this height usually returns nothing
+# NOTE: the old OCR_MIN_HEIGHT tunable is now enforced where it belongs —
+# AwirosANPR.predict_crop() short-circuits crops shorter than MIN_CROP_HEIGHT
+# (detect_yolo11_awiros_ocr.py), so video/live/image-API paths share one policy.
+
+# Duplicate-plate-track merging (batch pipeline, applied after the frame loop).
+# ByteTrack can hand out two IDs to one physical plate (ID switch after an
+# occlusion, or the track aged out during a detection gap and the plate got
+# re-detected as new). Tracks whose character-voted text agrees are folded
+# back together under safety gates.
+MERGE_MIN_CONF = 0.55    # BOTH tracks must vote a VALID Indian plate ≥ this conf
+MERGE_NEAR_FRAC = 0.12   # "ever spatially adjacent": min bbox-center distance
+                         # below this fraction of the frame diagonal
 
 # ---------------------------------------------------------------------------
 # ByteTracker wrapper (ultralytics BYTETracker, SimpleTracker-compatible API)
@@ -106,6 +121,15 @@ class ByteTracker:
 
     def update(self, detections: list) -> list:
         if not detections:
+            # Still step the internal tracker on empty frames so existing
+            # tracks age out (track_buffer) instead of living forever and
+            # re-matching stale boxes on the next detection.
+            empty = ByteTracker._ResultsView(
+                np.zeros((0, 4), dtype=float),
+                np.zeros((0,), dtype=float),
+                np.zeros((0,), dtype=int),
+            )
+            self._bt.update(empty)
             return []
         xyxy = np.array([[*d[0]] for d in detections], dtype=float)
         conf = np.array([d[1] for d in detections], dtype=float)
@@ -115,11 +139,16 @@ class ByteTracker:
         out = []
         for t in tracks:
             tx1, ty1, tx2, ty2, tid = float(t[0]), float(t[1]), float(t[2]), float(t[3]), int(t[4])
-            best_iou, best_idx = 0.0, 0
+            # Match the tracked box back to the detection it came from.
+            # Skip the track entirely when nothing overlaps — blindly
+            # attributing detections[0] recorded wrong boxes/confs.
+            best_iou, best_idx = 0.0, -1
             for i, (bbox, _) in enumerate(detections):
                 iou = self._iou_xyxy((tx1, ty1, tx2, ty2), bbox)
                 if iou > best_iou:
                     best_iou, best_idx = iou, i
+            if best_idx < 0 or best_iou <= 0.0:
+                continue
             out.append((tid, tuple(detections[best_idx][0]), detections[best_idx][1]))
         return out
 
@@ -186,11 +215,155 @@ def _pad_bbox(x1, y1, x2, y2, W, H, pad: float = 0.06):
     )
 
 # ---------------------------------------------------------------------------
-# Sharpness / clarity metric
+# Duplicate plate-track merging (post-loop de-duplication)
 # ---------------------------------------------------------------------------
-# Module-level cancel flag — set by the /api/cancel_video endpoint.
-# Checked once per frame in the processing loop so a long video can be
-# aborted mid-flight without killing the Flask worker thread.
+def _sample_seq(seq, cap: int = 150):
+    """Evenly down-sample a list to at most `cap` items (bounds O(n·m)
+    proximity checks on long tracks without changing the answer materially)."""
+    if len(seq) <= cap:
+        return seq
+    step = len(seq) / cap
+    return [seq[int(i * step)] for i in range(cap)]
+
+
+def _merge_two_plate_tracks(dst: dict, src: dict) -> None:
+    """Fold plate-history `src` into `dst`.
+
+    Unions the per-frame records (reads / yolo confs / bboxes / crop files)
+    sorted by processed frame index, and keeps whichever track produced the
+    better composite best-crop score — the same score formula used in-loop,
+    so the stored values are directly comparable.
+    """
+    rows = list(zip(dst["frames"], dst["reads"], dst["confs"],
+                    dst["bboxes"], dst["crop_files"]))
+    rows += list(zip(src["frames"], src["reads"], src["confs"],
+                     src["bboxes"], src["crop_files"]))
+    rows.sort(key=lambda r: r[0])
+    dst["frames"]     = [r[0] for r in rows]
+    dst["reads"]      = [r[1] for r in rows]
+    dst["confs"]      = [r[2] for r in rows]
+    dst["bboxes"]     = [r[3] for r in rows]
+    dst["crop_files"] = [r[4] for r in rows]
+
+    if float(src.get("best_score") or 0.0) > float(dst.get("best_score") or 0.0):
+        dst["best_frame"] = src["best_frame"]
+        dst["best_bbox"] = src["best_bbox"]
+        dst["best_text"] = src["best_text"]
+        dst["best_conf"] = src["best_conf"]
+    dst["best_score"] = max(float(dst.get("best_score") or 0.0),
+                            float(src.get("best_score") or 0.0))
+
+
+def _tracks_compatible(a: dict, b: dict, near_px: float) -> bool:
+    """Time/space gate between two same-text plate tracks.
+
+    True when their sightings never overlap in time (the car left and came
+    back) or when they were ever spatially adjacent (the classic tracker
+    ID-switch signature). Overlapping-in-time AND never adjacent smells like
+    two different vehicles wearing the same number — those stay separate.
+    """
+    if b["frames"][0] > a["frames"][-1]:      # time-disjoint → safe to merge
+        return True
+    # Windows overlap: merge only if the tracks were ever close.
+    for ba in _sample_seq(a["bboxes"]):
+        ax, ay = (ba[0] + ba[2]) / 2.0, (ba[1] + ba[3]) / 2.0
+        for bb in _sample_seq(b["bboxes"]):
+            bx, by = (bb[0] + bb[2]) / 2.0, (bb[1] + bb[3]) / 2.0
+            if math.hypot(ax - bx, ay - by) <= near_px:
+                return True
+    return False
+
+
+def _merge_duplicate_plate_tracks(
+    plate_history: defaultdict,
+    plate_to_vehicle_map: defaultdict,
+    frame_diag: float,
+    min_conf: float = MERGE_MIN_CONF,
+    near_frac: float = MERGE_NEAR_FRAC,
+) -> tuple:
+    """De-duplicate plate tracks that converged on the same plate number.
+
+    Runs ONCE after the frame loop, before results are compiled. Tracks whose
+    character-voted text normalizes identically — and where BOTH pass the
+    valid-Indian-plate grammar at >= min_conf confidence — are merged when
+    they are either time-disjoint or were ever spatially adjacent. The
+    survivor keeps the lowest original track id and inherits the absorbed
+    tracks' vehicle votes.
+
+    Returns:
+      merge_map  {survivor_tid: [absorbed_tids]} — merges applied
+      dup_groups {text: [separate tids]}         — same-text tracks NOT merged
+                                                   (overlap in time, never
+                                                   adjacent → possible cloned
+                                                   plates; surfaced instead of
+                                                   silently hidden)
+    """
+    votes = {tid: vote_track_text(ph["reads"])
+             for tid, ph in plate_history.items()}
+
+    # Group by canonical (normalized) text; garbage/low-conf reads never group.
+    groups = defaultdict(list)
+    for tid, v in votes.items():
+        if not v["valid"] or float(v["conf"]) < min_conf:
+            continue
+        key = (v.get("normalized") or v["text"]).strip().upper()
+        if key:
+            groups[key].append(tid)
+
+    near_px = near_frac * frame_diag
+    merge_map: dict = {}
+    dup_groups: dict = {}
+
+    for key, tids in groups.items():
+        if len(tids) < 2:
+            continue
+        # Chronological greedy clustering under the compatibility gate: a
+        # track joins the first cluster it is compatible with ANY member of.
+        tids.sort(key=lambda t: plate_history[t]["frames"][0])
+        clusters = [[tids[0]]]
+        for tid in tids[1:]:
+            ph = plate_history[tid]
+            target = None
+            for cl in clusters:
+                if any(_tracks_compatible(plate_history[m], ph, near_px)
+                       for m in cl):
+                    target = cl
+                    break
+            if target is not None:
+                target.append(tid)
+            else:
+                clusters.append([tid])
+
+        if len(clusters) > 1:
+            # Same text survived as distinct co-temporal clusters — flag it.
+            dup_groups[key] = [t for cl in clusters for t in cl]
+
+        for cl in clusters:
+            if len(cl) < 2:
+                continue
+            cl.sort()
+            survivor = cl[0]
+            for m in cl[1:]:
+                _merge_two_plate_tracks(plate_history[survivor],
+                                        plate_history[m])
+                del plate_history[m]
+                # Absorbed track's vehicle votes move to the survivor so the
+                # downstream majority vote sees the full history.
+                for veh, cnt in plate_to_vehicle_map.pop(m, {}).items():
+                    plate_to_vehicle_map[survivor][veh] += cnt
+            merge_map[survivor] = cl[1:]
+
+    return merge_map, dup_groups
+
+# ---------------------------------------------------------------------------
+# Cancel flag
+# ---------------------------------------------------------------------------
+# Module-level cancel flag — set by the /api/cancel_video endpoint. Checked
+# once per frame so a long video can be aborted mid-flight without killing
+# the Flask worker thread.
+# NOTE: this is a single global flag, so it assumes one video processed at a
+# time (the UI enforces this). Cancelling also cancels any other in-flight
+# video job; _reset_cancel() at the start of each run clears stale flags.
 _cancel_flag = False
 
 def request_cancel():
@@ -206,6 +379,9 @@ def _reset_cancel():
     _cancel_flag = False
 
 
+# ---------------------------------------------------------------------------
+# Sharpness / clarity metric
+# ---------------------------------------------------------------------------
 def _crop_sharpness(crop_bgr) -> float:
     """Blur metric: Laplacian variance on a fixed-size grayscale version.
 
@@ -231,11 +407,9 @@ def process_video(
     stride: int = 2,
     max_frames: int = None,
     write_video: bool = True,
-    awiros_dir: Path = None,
     yolo_model: str = None,         # Plate detector model name
     yolo_coco_model: str = None,    # COCO detector model name
     device: str = "cpu",
-    iou_thresh: float = 0.20,
 ) -> dict:
     """Run dual-YOLO tracking + Awiros OCR on a video, associate plates, and vote."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -278,8 +452,17 @@ def process_video(
     out_video = None
     if write_video:
         out_video_path = out_dir / "annotated.mp4"
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        out_video = cv2.VideoWriter(str(out_video_path), fourcc, fps, (W, H))
+        # H.264 (avc1) plays in browser <video> tags; the mp4v fallback does
+        # not decode in Chrome/Firefox/Edge (download still works). Use avc1
+        # when this OpenCV build can open it, else fall back.
+        for fourcc_tag in ("avc1", "mp4v"):
+            writer = cv2.VideoWriter(
+                str(out_video_path), cv2.VideoWriter_fourcc(*fourcc_tag), fps, (W, H)
+            )
+            if writer.isOpened():
+                out_video = writer
+                break
+            writer.release()
 
     # Plate tracker
     plate_tracker = ByteTracker(frame_rate=int(fps), max_age=max(30, int(fps * 2)))
@@ -331,273 +514,288 @@ def process_video(
     last_log_t = t0
     _reset_cancel()
 
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        n_proc += 1
-        if max_frames and n_proc > max_frames:
-            break
-        if _is_cancelled():
-            log.info("Cancel requested — stopping after frame %d", n_proc - 1)
-            break
-        if stride > 1 and (n_proc - 1) % stride != 0:
-            if out_video is not None:
-                out_video.write(frame)
-            continue
-
-        # ── 1. Run COCO Tracker (vehicles + persons) ──
-        # Classes: 0=person, 1=bicycle, 2=car, 3=motorcycle, 5=bus, 7=truck
-        coco_results = yolo_coco.track(
-            frame,
-            persist=True,
-            classes=[0, 1, 2, 3, 5, 7],
-            conf=DET_CONF,
-            tracker="bytetrack.yaml",
-            verbose=False,
-            device=infer_device
-        )[0]
-
-        coco_dets = []
-        if coco_results.boxes is not None and coco_results.boxes.id is not None:
-            for box in coco_results.boxes:
-                xyxy = box.xyxy[0].cpu().numpy().astype(int).tolist()
-                tid = int(box.id[0].cpu().numpy())
-                c = float(box.conf[0].cpu().numpy())
-                cls_id = int(box.cls[0].cpu().numpy())
-                cls_name = yolo_coco.names.get(cls_id, str(cls_id))
-                coco_dets.append({
-                    "track_id": tid,
-                    "bbox_xyxy": xyxy,
-                    "confidence": c,
-                    "class_name": cls_name,
-                })
-
-        # Save COCO tracks history
-        for d in coco_dets:
-            tid = d["track_id"]
-            bbox = d["bbox_xyxy"]
-            conf = d["confidence"]
-            cls_name = d["class_name"]
-            
-            x1, y1, x2, y2 = bbox
-            bx1, by1 = max(0, x1), max(0, y1)
-            bx2, by2 = min(W, x2), min(H, y2)
-            crop = frame[by1:by2, bx1:bx2]
-            
-            if crop.size == 0:
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            # Honor limits BEFORE counting the frame as processed — n_proc must
+            # equal the number of frames actually pulled through the pipeline.
+            if _is_cancelled():
+                log.info("Cancel requested — stopping at frame %d", n_proc)
+                break
+            if max_frames is not None and n_proc >= max_frames:
+                break
+            n_proc += 1
+            if stride > 1 and (n_proc - 1) % stride != 0:
+                if out_video is not None:
+                    out_video.write(frame)
                 continue
 
-            if cls_name == "person":
-                hist = person_history[tid]
-                hist["frames"].append(n_proc)
-                hist["bboxes"].append(bbox)
-                hist["confs"].append(conf)
-                
-                # Best crop = highest clarity (sharpness * area), not just area.
-                sharp = _crop_sharpness(crop)
-                area = max(1, (x2 - x1) * (y2 - y1))
-                score = sharp * area
-                if hist["best_bbox"] is None or score > float(hist.get("best_score") or 0.0) * 1.05:
-                    hist["best_frame"] = n_proc
-                    hist["best_bbox"] = bbox
-                    hist["best_score"] = score
-                    # Save crop file
-                    p_crop_name = f"person{tid:03d}_best.jpg"
-                    cv2.imwrite(str(best_frames_dir / p_crop_name), crop)
-                    hist["best_crop_file"] = p_crop_name
-            else:
-                hist = vehicle_history[tid]
-                hist["class_name"] = cls_name
-                hist["frames"].append(n_proc)
-                hist["bboxes"].append(bbox)
-                hist["confs"].append(conf)
-                
-                # Best crop = highest clarity (sharpness * area), not just area.
-                sharp = _crop_sharpness(crop)
-                area = max(1, (x2 - x1) * (y2 - y1))
-                score = sharp * area
-                if hist["best_bbox"] is None or score > float(hist.get("best_score") or 0.0) * 1.05:
-                    hist["best_frame"] = n_proc
-                    hist["best_bbox"] = bbox
-                    hist["best_score"] = score
-                    # Save crop file
-                    v_crop_name = f"vehicle{tid:03d}_best.jpg"
-                    cv2.imwrite(str(best_frames_dir / v_crop_name), crop)
-                    hist["best_crop_file"] = v_crop_name
+            # ── 1. Run COCO Tracker (vehicles + persons) ──
+            # Classes: 0=person, 1=bicycle, 2=car, 3=motorcycle, 5=bus, 7=truck
+            coco_results = yolo_coco.track(
+                frame,
+                persist=True,
+                classes=[0, 1, 2, 3, 5, 7],
+                conf=DET_CONF,
+                tracker="bytetrack.yaml",
+                verbose=False,
+                device=infer_device
+            )[0]
 
-        # ── 2. Run Plate Detector ──
-        plate_results = yolo_plate.predict(
-            frame, conf=DET_CONF, iou=0.45, imgsz=IMGSZ, verbose=False, device=infer_device
-        )[0]
-        raw_plate_dets = []
-        if plate_results.boxes is not None and len(plate_results.boxes) > 0:
-            for box in plate_results.boxes:
-                x1, y1, x2, y2 = box.xyxy[0].cpu().tolist()
-                yconf = float(box.conf[0].cpu().item())
-                
-                # Filter weird aspect ratios
-                bw, bh = x2 - x1, y2 - y1
-                if bh <= 0 or bw <= 0: continue
-                ar = bw / bh
-                if ar < 1.5 or ar > 6.5: continue
-                if bh < 16 or bh > 320: continue
-                raw_plate_dets.append(((int(x1), int(y1), int(x2), int(y2)), yconf))
+            coco_dets = []
+            if coco_results.boxes is not None and coco_results.boxes.id is not None:
+                for box in coco_results.boxes:
+                    xyxy = box.xyxy[0].cpu().numpy().astype(int).tolist()
+                    tid = int(box.id[0].cpu().numpy())
+                    c = float(box.conf[0].cpu().numpy())
+                    cls_id = int(box.cls[0].cpu().numpy())
+                    cls_name = yolo_coco.names.get(cls_id, str(cls_id))
+                    coco_dets.append({
+                        "track_id": tid,
+                        "bbox_xyxy": xyxy,
+                        "confidence": c,
+                        "class_name": cls_name,
+                    })
 
-        # ── 3. Track Plates ──
-        tracked_plates = plate_tracker.update(raw_plate_dets)
-
-        # ── 4. OCR on Plate Crops & BBox containment checks ──
-        frame_annotations = [] # for rendering annotated video
-        
-        for plate_tid, bbox, yconf in tracked_plates:
-            x1, y1, x2, y2 = bbox
-            x1c, y1c, x2c, y2c = _pad_bbox(x1, y1, x2, y2, W, H, pad=0.06)
-            crop = frame[y1c:y2c, x1c:x2c]
-            if crop.size == 0:
-                continue
-
-            ocr = awiros.predict_crop(crop)
-            text = ocr["text"] or ""
-            conf = ocr["confidence"]
-
-            hist = plate_history[plate_tid]
-            hist["reads"].append((text, conf))
-            hist["frames"].append(n_proc)
-            hist["bboxes"].append(bbox)
-            hist["confs"].append(yconf)
+            # Save COCO tracks history
+            for d in coco_dets:
+                tid = d["track_id"]
+                bbox = d["bbox_xyxy"]
+                conf = d["confidence"]
+                cls_name = d["class_name"]
             
-            # Save crop frame-by-frame
-            crop_fname = f"plate{plate_tid:03d}_f{n_proc:06d}.jpg"
-            cv2.imwrite(str(crops_dir / crop_fname), crop)
-            hist["crop_files"].append(crop_fname)
-
-            # Pick best crop — composite clarity score so the saved image
-            # genuinely looks like the clearest frame of this plate track.
-            #   sharpness : normalised Laplacian variance (primary "looks clear")
-            #   area      : bbox pixel area, log-weighted (more pixels = detail)
-            #   ocr_bonus : confirms characters are legible (text frames get ~2x
-            #               the weight of empty-text frames, which can still win
-            #               as a fallback when no readable frame ever appears)
-            prefer = False
-            best_score = float(hist.get("best_score") or 0.0)
-            best_text = hist.get("best_text") or ""
-
-            sharp = _crop_sharpness(crop)
-            area = max(1, (x2 - x1) * (y2 - y1))
-            ocr_bonus = (0.5 + 0.5 * conf) if text else 0.25
-            score = sharp * (1.0 + math.log(area)) * ocr_bonus
-
-            if hist["best_bbox"] is None:
-                # First detection always seeds the best so we have a fallback.
-                prefer = True
-            elif text and not best_text:
-                # We finally got a non-empty OCR where the current best is empty.
-                prefer = True
-            elif score > best_score * 1.05:
-                # 5% hysteresis — avoids flicker between near-equal frames.
-                prefer = True
-
-            if prefer:
-                hist["best_frame"] = n_proc
-                hist["best_bbox"] = bbox
-                hist["best_text"] = text
-                hist["best_conf"] = conf
-                hist["best_score"] = score
-                
-                # Save best annotated frame for this plate track
-                best_ann = frame.copy()
-                ann_color = (0, 255, 0) if (text and conf >= 0.20) else (0, 0, 255)
-                cv2.rectangle(best_ann, (x1, y1), (x2, y2), ann_color, 3)
-                ann_label = f"ID{plate_tid} {text or '?'} Conf={conf:.2f}"
-                cv2.putText(best_ann, ann_label, (x1, max(0, y1 - 10)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
-                best_ann_file = f"plate{plate_tid:03d}_best_annotated_f{n_proc:06d}.jpg"
-                cv2.imwrite(str(best_frames_dir / best_ann_file), best_ann)
-                hist["best_annotated_file"] = best_ann_file
-
-            # ── 5. Associate Plate track with Vehicle track ──
-            # Look for tracked vehicles in the same frame
-            best_vehicle_id = None
-            best_overlap = 0.0
+                x1, y1, x2, y2 = bbox
+                bx1, by1 = max(0, x1), max(0, y1)
+                bx2, by2 = min(W, x2), min(H, y2)
+                crop = frame[by1:by2, bx1:bx2]
             
-            for v in coco_dets:
-                if v["class_name"] == "person":
+                if crop.size == 0:
                     continue
-                vx1, vy1, vx2, vy2 = v["bbox_xyxy"]
-                ix1 = max(x1, vx1)
-                iy1 = max(y1, vy1)
-                ix2 = min(x2, vx2)
-                iy2 = min(y2, vy2)
-                
-                iw = max(0, ix2 - ix1)
-                ih = max(0, iy2 - iy1)
-                inter_area = iw * ih
-                
-                p_area = (x2 - x1) * (y2 - y1)
-                if p_area <= 0: continue
-                
-                overlap = inter_area / p_area
-                if overlap > 0.70 and overlap > best_overlap:
-                    best_overlap = overlap
-                    best_vehicle_id = v["track_id"]
-                    
-            if best_vehicle_id is not None:
-                plate_to_vehicle_map[plate_tid][best_vehicle_id] += 1
-                
-            frame_annotations.append((plate_tid, bbox, text, conf, best_vehicle_id))
 
-        # ── 6. Render Frame and write video ──
-        ann_frame = frame.copy()
+                if cls_name == "person":
+                    hist = person_history[tid]
+                    hist["frames"].append(n_proc)
+                    hist["bboxes"].append(bbox)
+                    hist["confs"].append(conf)
+                
+                    # Best crop = highest clarity (sharpness * area), not just area.
+                    sharp = _crop_sharpness(crop)
+                    area = max(1, (x2 - x1) * (y2 - y1))
+                    score = sharp * area
+                    if hist["best_bbox"] is None or score > float(hist.get("best_score") or 0.0) * 1.05:
+                        hist["best_frame"] = n_proc
+                        hist["best_bbox"] = bbox
+                        hist["best_score"] = score
+                        # Save crop file
+                        p_crop_name = f"person{tid:03d}_best.jpg"
+                        cv2.imwrite(str(best_frames_dir / p_crop_name), crop)
+                        hist["best_crop_file"] = p_crop_name
+                else:
+                    hist = vehicle_history[tid]
+                    hist["class_name"] = cls_name
+                    hist["frames"].append(n_proc)
+                    hist["bboxes"].append(bbox)
+                    hist["confs"].append(conf)
+                
+                    # Best crop = highest clarity (sharpness * area), not just area.
+                    sharp = _crop_sharpness(crop)
+                    area = max(1, (x2 - x1) * (y2 - y1))
+                    score = sharp * area
+                    if hist["best_bbox"] is None or score > float(hist.get("best_score") or 0.0) * 1.05:
+                        hist["best_frame"] = n_proc
+                        hist["best_bbox"] = bbox
+                        hist["best_score"] = score
+                        # Save crop file
+                        v_crop_name = f"vehicle{tid:03d}_best.jpg"
+                        cv2.imwrite(str(best_frames_dir / v_crop_name), crop)
+                        hist["best_crop_file"] = v_crop_name
+
+            # ── 2. Run Plate Detector ──
+            plate_results = yolo_plate.predict(
+                frame, conf=DET_CONF, iou=0.45, imgsz=IMGSZ, verbose=False, device=infer_device
+            )[0]
+            raw_plate_dets = []
+            if plate_results.boxes is not None and len(plate_results.boxes) > 0:
+                for box in plate_results.boxes:
+                    x1, y1, x2, y2 = box.xyxy[0].cpu().tolist()
+                    yconf = float(box.conf[0].cpu().item())
+                
+                    # Filter weird aspect ratios
+                    bw, bh = x2 - x1, y2 - y1
+                    if bh <= 0 or bw <= 0: continue
+                    ar = bw / bh
+                    if ar < 1.5 or ar > 6.5: continue
+                    if bh < 16 or bh > 320: continue
+                    raw_plate_dets.append(((int(x1), int(y1), int(x2), int(y2)), yconf))
+
+            # ── 3. Track Plates ──
+            tracked_plates = plate_tracker.update(raw_plate_dets)
+
+            # ── 4. OCR on Plate Crops & BBox containment checks ──
+            frame_annotations = [] # for rendering annotated video
         
-        # Draw vehicle bboxes (blue)
-        for v in coco_dets:
-            tx1, ty1, tx2, ty2 = v["bbox_xyxy"]
-            if v["class_name"] == "person":
-                cv2.rectangle(ann_frame, (tx1, ty1), (tx2, ty2), (0, 165, 255), 2)
-                cv2.putText(ann_frame, f"person #{v['track_id']}", (tx1, max(ty1 - 5, 15)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1, cv2.LINE_AA)
-            else:
-                cv2.rectangle(ann_frame, (tx1, ty1), (tx2, ty2), (255, 128, 0), 2)
-                cv2.putText(ann_frame, f"{v['class_name']} #{v['track_id']}", (tx1, max(ty1 - 5, 15)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 128, 0), 1, cv2.LINE_AA)
+            for plate_tid, bbox, yconf in tracked_plates:
+                x1, y1, x2, y2 = bbox
+                x1c, y1c, x2c, y2c = _pad_bbox(x1, y1, x2, y2, W, H, pad=0.06)
+                crop = frame[y1c:y2c, x1c:x2c]
+                if crop.size == 0:
+                    continue
+
+                ocr = awiros.predict_crop(crop)
+                text = ocr["text"] or ""
+                conf = ocr["confidence"]
+
+                hist = plate_history[plate_tid]
+                hist["reads"].append((text, conf))
+                hist["frames"].append(n_proc)
+                hist["bboxes"].append(bbox)
+                hist["confs"].append(yconf)
+            
+                # Save crop frame-by-frame. PNG keeps a pixel-exact audit
+                # record of exactly what the OCR engine saw (JPEG would
+                # recompress the evidence); plate crops are small so the
+                # size penalty is negligible.
+                crop_fname = f"plate{plate_tid:03d}_f{n_proc:06d}.png"
+                cv2.imwrite(str(crops_dir / crop_fname), crop)
+                hist["crop_files"].append(crop_fname)
+
+                # Pick best crop — composite clarity score so the saved image
+                # genuinely looks like the clearest frame of this plate track.
+                #   sharpness : normalised Laplacian variance (primary "looks clear")
+                #   area      : bbox pixel area, log-weighted (more pixels = detail)
+                #   ocr_bonus : confirms characters are legible (text frames get ~2x
+                #               the weight of empty-text frames, which can still win
+                #               as a fallback when no readable frame ever appears)
+                prefer = False
+                best_score = float(hist.get("best_score") or 0.0)
+                best_text = hist.get("best_text") or ""
+
+                sharp = _crop_sharpness(crop)
+                area = max(1, (x2 - x1) * (y2 - y1))
+                ocr_bonus = (0.5 + 0.5 * conf) if text else 0.25
+                score = sharp * (1.0 + math.log(area)) * ocr_bonus
+
+                if hist["best_bbox"] is None:
+                    # First detection always seeds the best so we have a fallback.
+                    prefer = True
+                elif text and not best_text:
+                    # We finally got a non-empty OCR where the current best is empty.
+                    prefer = True
+                elif score > best_score * 1.05:
+                    # 5% hysteresis — avoids flicker between near-equal frames.
+                    prefer = True
+
+                if prefer:
+                    hist["best_frame"] = n_proc
+                    hist["best_bbox"] = bbox
+                    hist["best_text"] = text
+                    hist["best_conf"] = conf
+                    hist["best_score"] = score
+                
+                    # Save best annotated frame for this plate track
+                    best_ann = frame.copy()
+                    ann_color = (0, 255, 0) if (text and conf >= 0.20) else (0, 0, 255)
+                    cv2.rectangle(best_ann, (x1, y1), (x2, y2), ann_color, 3)
+                    ann_label = f"ID{plate_tid} {text or '?'} Conf={conf:.2f}"
+                    cv2.putText(best_ann, ann_label, (x1, max(0, y1 - 10)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
+                    best_ann_file = f"plate{plate_tid:03d}_best_annotated_f{n_proc:06d}.jpg"
+                    cv2.imwrite(str(best_frames_dir / best_ann_file), best_ann)
+                    hist["best_annotated_file"] = best_ann_file
+
+                # ── 5. Associate Plate track with Vehicle track ──
+                # Look for tracked vehicles in the same frame
+                best_vehicle_id = None
+                best_overlap = 0.0
+            
+                for v in coco_dets:
+                    if v["class_name"] == "person":
+                        continue
+                    vx1, vy1, vx2, vy2 = v["bbox_xyxy"]
+                    ix1 = max(x1, vx1)
+                    iy1 = max(y1, vy1)
+                    ix2 = min(x2, vx2)
+                    iy2 = min(y2, vy2)
+                
+                    iw = max(0, ix2 - ix1)
+                    ih = max(0, iy2 - iy1)
+                    inter_area = iw * ih
+                
+                    p_area = (x2 - x1) * (y2 - y1)
+                    if p_area <= 0: continue
+                
+                    overlap = inter_area / p_area
+                    if overlap > 0.70 and overlap > best_overlap:
+                        best_overlap = overlap
+                        best_vehicle_id = v["track_id"]
+                    
+                if best_vehicle_id is not None:
+                    plate_to_vehicle_map[plate_tid][best_vehicle_id] += 1
+                
+                frame_annotations.append((plate_tid, bbox, text, conf, best_vehicle_id))
+
+            # ── 6. Render Frame and write video ──
+            ann_frame = frame.copy()
+        
+            # Draw vehicle bboxes (blue)
+            for v in coco_dets:
+                tx1, ty1, tx2, ty2 = v["bbox_xyxy"]
+                if v["class_name"] == "person":
+                    cv2.rectangle(ann_frame, (tx1, ty1), (tx2, ty2), (0, 165, 255), 2)
+                    cv2.putText(ann_frame, f"person #{v['track_id']}", (tx1, max(ty1 - 5, 15)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1, cv2.LINE_AA)
+                else:
+                    cv2.rectangle(ann_frame, (tx1, ty1), (tx2, ty2), (255, 128, 0), 2)
+                    cv2.putText(ann_frame, f"{v['class_name']} #{v['track_id']}", (tx1, max(ty1 - 5, 15)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 128, 0), 1, cv2.LINE_AA)
                             
-        # Draw plate bboxes (green/red)
-        for plate_tid, bbox, text, conf, v_tid in frame_annotations:
-            tx1, ty1, tx2, ty2 = bbox
-            color = (0, 255, 0) if (text and conf >= 0.20) else (0, 0, 255)
-            cv2.rectangle(ann_frame, (tx1, ty1), (tx2, ty2), color, 3)
+            # Draw plate bboxes (green/red)
+            for plate_tid, bbox, text, conf, v_tid in frame_annotations:
+                tx1, ty1, tx2, ty2 = bbox
+                color = (0, 255, 0) if (text and conf >= 0.20) else (0, 0, 255)
+                cv2.rectangle(ann_frame, (tx1, ty1), (tx2, ty2), color, 3)
             
-            lbl = f"Plate #{plate_tid}: {text or '?'}"
-            if v_tid is not None:
-                lbl += f" (Veh #{v_tid})"
-            cv2.putText(ann_frame, lbl, (tx1, max(ty2 + 15, H - 5)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2, cv2.LINE_AA)
+                lbl = f"Plate #{plate_tid}: {text or '?'}"
+                if v_tid is not None:
+                    lbl += f" (Veh #{v_tid})"
+                cv2.putText(ann_frame, lbl, (tx1, max(ty2 + 15, H - 5)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2, cv2.LINE_AA)
 
-        cv2.putText(ann_frame, f"frame {n_proc}/{total}  YOLO11 + Awiros ANPR-OCR",
-                    (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 3)
-        cv2.putText(ann_frame, f"frame {n_proc}/{total}  YOLO11 + Awiros ANPR-OCR",
-                    (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1)
+            cv2.putText(ann_frame, f"frame {n_proc}/{total}  YOLO11 + Awiros ANPR-OCR",
+                        (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 3)
+            cv2.putText(ann_frame, f"frame {n_proc}/{total}  YOLO11 + Awiros ANPR-OCR",
+                        (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1)
 
+            if out_video is not None:
+                out_video.write(ann_frame)
+            
+            # Save one annotated frame per second for timeline previews
+            if n_proc % max(1, int(fps)) == 0 or n_proc == 1:
+                cv2.imwrite(str(frames_dir / f"frame_{n_proc:06d}.jpg"), ann_frame)
+
+            if time.time() - last_log_t > 3.0:
+                elapsed = time.time() - t0
+                log.info("  frame %d/%d  active_tracks=%d  (%.1fs elapsed)",
+                         n_proc, total, len(coco_dets), elapsed)
+                last_log_t = time.time()
+
+    finally:
+        cap.release()
         if out_video is not None:
-            out_video.write(ann_frame)
-            
-        # Save one annotated frame per second for timeline previews
-        if n_proc % max(1, int(fps)) == 0 or n_proc == 1:
-            cv2.imwrite(str(frames_dir / f"frame_{n_proc:06d}.jpg"), ann_frame)
-
-        if time.time() - last_log_t > 3.0:
-            elapsed = time.time() - t0
-            log.info("  frame %d/%d  active_tracks=%d  (%.1fs elapsed)",
-                     n_proc, total, len(coco_dets), elapsed)
-            last_log_t = time.time()
-
-    cap.release()
-    if out_video is not None:
-        out_video.release()
+            out_video.release()
 
     # ── 7. Compile unified tracking results and run Voting ──
     
+    # De-duplicate plate tracks that converged on the same number (tracker
+    # ID switches / re-detections). Runs BEFORE the vehicle-majority vote so
+    # absorbed tracks transfer their vehicle links to the survivor.
+    merge_map, dup_groups = _merge_duplicate_plate_tracks(
+        plate_history, plate_to_vehicle_map, math.hypot(W, H),
+    )
+    dup_of = {tid: key for key, tids in dup_groups.items() for tid in tids}
+
     # Map plate tracks to vehicle tracks using majority vote
     vehicle_to_plate_map = {}
     for plate_tid, counter in plate_to_vehicle_map.items():
@@ -652,7 +850,8 @@ def process_video(
                     if int(fnum) == best_frame_num:
                         src_crop = crops_dir / ph["crop_files"][i]
                         if src_crop.exists():
-                            best_plate_crop = f"plate{plate_tid:03d}_best_f{best_frame_num:06d}.jpg"
+                            # Keep the source extension — crops are PNG now
+                            best_plate_crop = f"plate{plate_tid:03d}_best_f{best_frame_num:06d}{src_crop.suffix}"
                             shutil.copy2(str(src_crop), str(best_frames_dir / best_plate_crop))
                         break
             
@@ -677,6 +876,8 @@ def process_video(
                 "n_unique_reads": len(set(t for t, _ in ph["reads"] if t)),
                 "votes_per_pos": voted["votes"],
                 "vehicle_crop_file": best_crop_file,
+                "merged_from": sorted(merge_map.get(plate_tid, [])),
+                "duplicate_text_group": dup_of.get(plate_tid, ""),
             })
         else:
             # Vehicle with no plate associated
@@ -774,7 +975,8 @@ def process_video(
                 if int(fnum) == best_frame_num:
                     src_crop = crops_dir / ph["crop_files"][i]
                     if src_crop.exists():
-                        best_plate_crop = f"plate{plate_tid:03d}_best_f{best_frame_num:06d}.jpg"
+                        # Keep the source extension — crops are PNG now
+                        best_plate_crop = f"plate{plate_tid:03d}_best_f{best_frame_num:06d}{src_crop.suffix}"
                         shutil.copy2(str(src_crop), str(best_frames_dir / best_plate_crop))
                     break
                     
@@ -800,6 +1002,8 @@ def process_video(
             "n_unique_reads": len(set(t for t, _ in ph["reads"] if t)),
             "votes_per_pos": voted["votes"],
             "vehicle_crop_file": "",
+            "merged_from": sorted(merge_map.get(plate_tid, [])),
+            "duplicate_text_group": dup_of.get(plate_tid, ""),
         })
 
     # Sort tracks: Vehicles with valid plates first, then general vehicles, then persons, then standalone plates
@@ -831,10 +1035,11 @@ def process_video(
         "fps_processed": round(n_proc / elapsed, 2) if elapsed > 0 else 0.0,
         "n_tracks": len(tracks_summary),
         "n_valid_plates": sum(1 for t in tracks_summary if t.get("valid_indian")),
+        "n_merged_plate_tracks": sum(len(v) for v in merge_map.values()),
+        "duplicate_plate_groups": dup_groups,
         "detector": f"COCO: {coco_model_name}, Plate: {plate_model_name}",
         "ocr": "Awiros ANPR-OCR",
         "device": device,
-        "iou_thresh": iou_thresh,
         "tracks": tracks_summary,
         "output_dir": str(out_dir),
     }

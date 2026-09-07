@@ -1,5 +1,6 @@
 import time
 import base64
+import threading
 import urllib.request
 import cv2
 import numpy as np
@@ -61,6 +62,10 @@ class ANPREngine:
     def __init__(self):
         self.yolo_models = {}
         self.awiros = None
+        # Flask's dev server is threaded — lazy model loads are check-then-set
+        # and must be serialized or two concurrent first requests each load
+        # their own multi-hundred-MB copy (PaddleOCR double-init also leaks).
+        self._cache_lock = threading.RLock()
         self._check_openvino()
 
     @classmethod
@@ -80,40 +85,53 @@ class ANPREngine:
             print("[APP] OpenVINO not installed — YOLO models will use PyTorch CPU.")
             cls._OPENVINO_DEVICE = None
 
+    def _resolve_yolo_source(self, name: str):
+        """Resolve a model name to its best on-disk source.
+
+        Prefers the OpenVINO-exported directory (``<stem>_openvino_model/``)
+        when GPU acceleration is available, otherwise the ``.pt`` weights.
+        Downloads fine-tuned plate weights from Hugging Face if missing.
+        No caching — see :meth:`_get_yolo_model` for the cached variant.
+        """
+        name_clean = name.strip()
+        if "_plate" in name_clean or "plate" in name_clean:
+            model_path = ensure_plate_model(name_clean)
+            stem = model_path.stem  # e.g. "yolo11_plate"
+            ov_dir = model_path.parent / f"{stem}_openvino_model"
+        else:
+            # Standard COCO model, e.g., yolo11s.pt
+            filename = name_clean if name_clean.endswith(".pt") else f"{name_clean}.pt"
+            local = HERE / filename
+            model_path = local if local.exists() else filename
+            stem = Path(filename).stem
+            ov_dir = HERE / f"{stem}_openvino_model"
+        if self._OPENVINO_DEVICE and ov_dir.is_dir():
+            return ov_dir
+        return model_path
+
+    def _build_yolo(self, name: str):
+        """Build a fresh, uncached YOLO instance (new tracker state)."""
+        from ultralytics import YOLO
+
+        src = self._resolve_yolo_source(name)
+        print(f"[APP] Loading YOLO model: {Path(src).name}")
+        return YOLO(str(src), task="detect")
+
     def _get_yolo_model(self, name: str):
         name_clean = name.strip()
-        if name_clean not in self.yolo_models:
-            from ultralytics import YOLO
-            if "_plate" in name_clean or "plate" in name_clean:
-                model_path = ensure_plate_model(name_clean)
-                stem = model_path.stem  # e.g. "yolo11_plate"
-                ov_dir = model_path.parent / f"{stem}_openvino_model"
-                if self._OPENVINO_DEVICE and ov_dir.is_dir():
-                    print(f"[APP] Loading Plate YOLO (OpenVINO GPU): {ov_dir.name}")
-                    self.yolo_models[name_clean] = YOLO(str(ov_dir), task="detect")
-                else:
-                    print(f"[APP] Loading Plate YOLO model: {model_path.name}")
-                    self.yolo_models[name_clean] = YOLO(str(model_path))
-            else:
-                # Standard COCO model, e.g., yolo11s.pt
-                filename = name_clean if name_clean.endswith(".pt") else f"{name_clean}.pt"
-                stem = Path(filename).stem
-                ov_dir = HERE / f"{stem}_openvino_model"
-                if self._OPENVINO_DEVICE and ov_dir.is_dir():
-                    print(f"[APP] Loading COCO YOLO (OpenVINO GPU): {ov_dir.name}")
-                    self.yolo_models[name_clean] = YOLO(str(ov_dir), task="detect")
-                else:
-                    print(f"[APP] Loading COCO YOLO model: {filename}")
-                    self.yolo_models[name_clean] = YOLO(filename)
-        return self.yolo_models[name_clean]
+        with self._cache_lock:
+            if name_clean not in self.yolo_models:
+                self.yolo_models[name_clean] = self._build_yolo(name_clean)
+            return self.yolo_models[name_clean]
 
     def _ensure_awiros(self):
-        if self.awiros is None:
-            print(f"[APP] Loading Awiros ANPR-OCR...")
-            from detect_yolo11_awiros_ocr import AwirosANPR
-            self.awiros = AwirosANPR(awiros_dir=AWIROS_DIR, device="cpu")
-            self.awiros.load()
-            print(f"[APP] Awiros loaded | dict: {self.awiros.dict_path.name}")
+        with self._cache_lock:
+            if self.awiros is None:
+                print(f"[APP] Loading Awiros ANPR-OCR...")
+                from detect_yolo11_awiros_ocr import AwirosANPR
+                self.awiros = AwirosANPR(awiros_dir=AWIROS_DIR, device="cpu")
+                self.awiros.load()
+                print(f"[APP] Awiros loaded | dict: {self.awiros.dict_path.name}")
 
     def warmup(self):
         """Warm up default models."""
@@ -261,7 +279,7 @@ class ANPREngine:
                     "text": p["ocr"]["text"],
                     "ocr_confidence": p["ocr"]["confidence"],
                     "readable": p["ocr"]["readable"],
-                    "crop_url": _crop_to_b64(p["crop_bgr"], 160),
+                    "crop_url": _crop_to_b64(p["crop_bgr"], PLATE_PREVIEW_MAX_W),
                 }
 
             vehicles_payload.append({
@@ -293,7 +311,7 @@ class ANPREngine:
                 "text": p["ocr"]["text"],
                 "ocr_confidence": p["ocr"]["confidence"],
                 "readable": p["ocr"]["readable"],
-                "crop_url": _crop_to_b64(p["crop_bgr"], 160),
+                "crop_url": _crop_to_b64(p["crop_bgr"], PLATE_PREVIEW_MAX_W),
             })
 
         # 5. Draw Annotated Result Image
@@ -349,6 +367,12 @@ def _img_to_b64(img: np.ndarray, ext: str = ".jpg") -> str:
     b64 = base64.b64encode(buf.tobytes()).decode("ascii")
     mime = "image/jpeg" if ext in (".jpg", ".jpeg") else "image/png"
     return f"data:{mime};base64,{b64}"
+
+# Max width for base64 plate-crop previews embedded in JSON payloads.
+# Aligned with core/live.py's _encode_crop_jpeg (max_w=400) so the image-API
+# UI shows enough detail for a human to verify what the OCR engine saw.
+PLATE_PREVIEW_MAX_W = 400
+
 
 def _crop_to_b64(crop: np.ndarray, max_w: int = 320) -> str:
     """Resize crop if width > max_w to keep JSON payload lightweight."""

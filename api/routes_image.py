@@ -4,7 +4,7 @@ import tempfile
 import traceback
 from datetime import datetime
 from pathlib import Path
-from flask import Blueprint, jsonify, render_template, request, redirect, send_from_directory
+from flask import Blueprint, jsonify, render_template, request, send_from_directory
 
 from core.engine import engine, _read_image, _decode_b64
 
@@ -18,12 +18,30 @@ RESULTS_DIR = HERE / "results"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
+# Only these upload suffixes are accepted (the suffix is attacker-controlled;
+# uploads are decoded with cv2 so exotic names would just fail later anyway).
+_ALLOWED_UPLOAD_EXTS = {
+    ".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff",
+    ".mp4", ".avi", ".mov", ".mkv", ".webm",
+}
+
 def _save_upload(file_storage) -> str:
-    suffix = Path(file_storage.filename or "").suffix or ".jpg"
+    suffix = Path(file_storage.filename or "").suffix.lower()
+    if suffix not in _ALLOWED_UPLOAD_EXTS:
+        suffix = ".jpg"
     tmp = tempfile.NamedTemporaryFile(dir=UPLOAD_DIR, suffix=suffix, delete=False)
     file_storage.save(tmp.name)
     tmp.close()
     return tmp.name
+
+def _parse_conf() -> tuple[float | None, str]:
+    """Parse the shared 'conf' form field. Returns (value, error)."""
+    raw = request.form.get("conf", 0.25)
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return None, "conf must be a number."
+    return min(0.99, max(0.01, val)), ""
 
 def _save_result_image(stem: str, img_bgr) -> str:
     import cv2
@@ -49,7 +67,9 @@ def api_predict():
         
         model_coco = request.form.get("model_coco", "yolo11s")
         model_plate = request.form.get("model_plate", "yolo11_plate")
-        conf = float(request.form.get("conf", 0.25))
+        conf, err = _parse_conf()
+        if err:
+            return jsonify(error=err), 400
 
         path = _save_upload(f)
         try:
@@ -76,7 +96,9 @@ def api_detect():
         if f is None or not f.filename:
             return jsonify(error="No image uploaded. Send a file in the 'image' field."), 400
 
-        conf = float(request.form.get("conf", 0.25))
+        conf, err = _parse_conf()
+        if err:
+            return jsonify(error=err), 400
         model_coco = request.form.get("model_coco", "yolo11s")
         model_plate = request.form.get("model_plate", "yolo11_plate")
         
@@ -126,7 +148,7 @@ def api_detect():
                     "detector_coco": f"YOLO11 ({model_coco})",
                     "detector_plate": f"YOLO11 ({model_plate})",
                     "ocr": "Awiros ANPR-OCR (PP-OCRv5 SVTR_HGNet / CTC)",
-                    "device": "cpu",
+                    "device": engine._OPENVINO_DEVICE or "cpu",
                 },
             }
             return jsonify(response)
@@ -153,10 +175,13 @@ def health():
 @image_bp.get("/health/full")
 def health_full():
     """Health endpoint used by the live-dashboard to surface what the
-    pipeline has cached. Includes per-model readiness flags."""
+    pipeline has cached. Includes per-model readiness flags + the compute
+    device (OpenVINO GPU vs PyTorch CPU) shown in the UI header."""
+    device = "intel:gpu (OpenVINO)" if engine._OPENVINO_DEVICE else "cpu (PyTorch)"
     return jsonify(
         status="ok",
         yolo_loaded=len(engine.yolo_models) > 0,
         awiros_loaded=engine.awiros is not None,
         cached_models=sorted(engine.yolo_models.keys()),
+        device=device,
     )

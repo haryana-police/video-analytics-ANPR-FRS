@@ -1,0 +1,313 @@
+{
+  "generated_at": "2026-08-23T22:34:48",
+  "device": "intel:gpu",
+  "models": {
+    "coco": "yolo11n",
+    "plate": "yolo11_plate",
+    "ocr": "Awiros ANPR (PP-OCRv5 SVTR_HGNet)"
+  },
+  "settings": {
+    "frames_per_video": 3,
+    "max_plates_per_frame": 2,
+    "conf": 0.25,
+    "plate_ar_filter": [
+      1.5,
+      6.5
+    ]
+  },
+  "videos": [
+    {
+      "video": "1.mp4",
+      "total_frames": 5244,
+      "frames": [
+        {
+          "frame_index": 1573,
+          "size": [
+            1280,
+            720
+          ],
+          "coco_ms": 5422.2,
+          "plate_ms": 749.2,
+          "n_detections": 16,
+          "n_vehicles": 2,
+          "n_persons": 14,
+          "n_plates_kept": 0,
+          "n_plates_filtered": 0,
+          "plates": [],
+          "images": [
+            "f001573_objects.jpg",
+            "f001573_plates.jpg",
+            "f001573_ocr.jpg"
+          ]
+        },
+        {
+          "frame_index": 2884,
+          "size": [
+            1280,
+            720
+          ],
+          "coco_ms": 9.8,
+          "plate_ms": 18.6,
+          "n_detections": 19,
+          "n_vehicles": 12,
+          "n_persons": 7,
+          "n_plates_kept": 3,
+          "n_plates_filtered": 0,
+          "plates": [
+            {
+              "bbox_xyxy": [
+                1015,
+                510,
+                1098,
+                535
+              ],
+              "yolo_conf": 0.5884,
+              "ocr_text": "HR0ad",
+              "ocr_conf": 0.608,
+              "valid_indian": false,
+              "ocr_ms": 680.4
+            },
+            {
+              "bbox_xyxy": [
+                266,
+                448,
+                336,
+                471
+              ],
+              "yolo_conf": 0.6357,
+              "ocr_text": "HR67B5432",
+              "ocr_conf": 0.9992,
+              "valid_indian": true,
+              "ocr_ms": 649.2
+            }
+          ],
+          "images": [
+            "f002884_objects.jpg",
+            "f002884_plates.jpg",
+            "f002884_ocr.jpg"
+          ]
+        },
+        {
+          "frame_index": 4195,
+          "size": [
+            1280,
+            720
+          ],
+          "coco_ms": 15.2,
+          "plate_ms": 12.3,
+          "n_detections": 27,
+          "n_vehicles": 18,
+          "n_persons": 9,
+          "n_plates_kept": 2,
+          "n_plates_filtered": 0,
+          "plates": [
+            {
+              "bbox_xyxy": [
+                1076,
+                545,
+                1163,
+                572
+              ],
+              "yolo_conf": 0.6167,
+              "ocr_text": "HR24F0073",
+              "ocr_conf": 0.5502,
+              "valid_indian": true,
+              "ocr_ms": 657.6
+            },
+            {
+              "bbox_xyxy": [
+                266,
+                448,
+                332,
+                470
+              ],
+              "yolo_conf": 0.6572,
+              "ocr_text": "HR67B5432",
+              "ocr_conf": 1.0,
+              "valid_indian": true,
+              "ocr_ms": 687.9
+            }
+          ],
+          "images": [
+            "f004195_objects.jpg",
+            "f004195_plates.jpg",
+            "f004195_ocr.jpg"
+          ]
+        }
+      ]
+    },
+    {
+      "video": "2.mp4",
+      "total_frames": 5389,
+      "frames": [
+        {
+          "frame_index": 1616,
+          "size": [
+            1280,
+            720
+          ],
+          "coco_ms": 14.8,
+          "plate_ms": 10.5,
+          "n_detections": 24,
+          "n_vehicles": 15,
+          "n_persons": 9,
+          "n_plates_kept": 0,
+          "n_plates_filtered": 0,
+          "plates": [],
+          "images": [
+            "f001616_objects.jpg",
+            "f001616_plates.jpg",
+            "f001616_ocr.jpg"
+          ]
+        },
+        {
+          "frame_index": 2963,
+          "size": [
+            1280,
+            720
+          ],
+          "coco_ms": 19.7,
+          "plate_ms": 14.4,
+          "n_detections": 24,
+          "n_vehicles": 15,
+          "n_persons": 9,
+          "n_plates_kept": 0,
+          "n_plates_filtered": 1,
+          "plates": [],
+          "images": [
+            "f002963_objects.jpg",
+            "f002963_plates.jpg",
+            "f002963_ocr.jpg"
+          ]
+        },
+        {
+          "frame_index": 4311,
+          "size": [
+            1280,
+            720
+          ],
+          "coco_ms": 33.9,
+          "plate_ms": 12.2,
+          "n_detections": 23,
+          "n_vehicles": 12,
+          "n_persons": 11,
+          "n_plates_kept": 1,
+          "n_plates_filtered": 0,
+          "plates": [
+            {
+              "bbox_xyxy": [
+                196,
+                580,
+                272,
+                618
+              ],
+              "yolo_conf": 0.2759,
+              "ocr_text": "MH0MH15MH61",
+              "ocr_conf": 0.3609,
+              "valid_indian": false,
+              "ocr_ms": 991.1
+            }
+          ],
+          "images": [
+            "f004311_objects.jpg",
+            "f004311_plates.jpg",
+            "f004311_ocr.jpg"
+          ]
+        }
+      ]
+    },
+    {
+      "video": "3.mp4",
+      "total_frames": 5443,
+      "frames": [
+        {
+          "frame_index": 1632,
+          "size": [
+            1280,
+            720
+          ],
+          "coco_ms": 8.0,
+          "plate_ms": 13.1,
+          "n_detections": 21,
+          "n_vehicles": 21,
+          "n_persons": 0,
+          "n_plates_kept": 2,
+          "n_plates_filtered": 2,
+          "plates": [
+            {
+              "bbox_xyxy": [
+                828,
+                478,
+                881,
+                497
+              ],
+              "yolo_conf": 0.3579,
+              "ocr_text": "MH133",
+              "ocr_conf": 0.2286,
+              "valid_indian": false,
+              "ocr_ms": 1569.1
+            },
+            {
+              "bbox_xyxy": [
+                169,
+                561,
+                221,
+                578
+              ],
+              "yolo_conf": 0.4849,
+              "ocr_text": "HR61",
+              "ocr_conf": 0.1851,
+              "valid_indian": false,
+              "ocr_ms": 943.3
+            }
+          ],
+          "images": [
+            "f001632_objects.jpg",
+            "f001632_plates.jpg",
+            "f001632_ocr.jpg"
+          ]
+        },
+        {
+          "frame_index": 2993,
+          "size": [
+            1280,
+            720
+          ],
+          "coco_ms": 17.9,
+          "plate_ms": 11.9,
+          "n_detections": 8,
+          "n_vehicles": 8,
+          "n_persons": 0,
+          "n_plates_kept": 0,
+          "n_plates_filtered": 0,
+          "plates": [],
+          "images": [
+            "f002993_objects.jpg",
+            "f002993_plates.jpg",
+            "f002993_ocr.jpg"
+          ]
+        },
+        {
+          "frame_index": 4354,
+          "size": [
+            1280,
+            720
+          ],
+          "coco_ms": 14.1,
+          "plate_ms": 15.8,
+          "n_detections": 14,
+          "n_vehicles": 13,
+          "n_persons": 1,
+          "n_plates_kept": 0,
+          "n_plates_filtered": 1,
+          "plates": [],
+          "images": [
+            "f004354_objects.jpg",
+            "f004354_plates.jpg",
+            "f004354_ocr.jpg"
+          ]
+        }
+      ]
+    }
+  ]
+}

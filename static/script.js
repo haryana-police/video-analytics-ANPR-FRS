@@ -1,116 +1,140 @@
 // ==========================================================================
-// TRAFFIC MANAGEMENT SYSTEM — v4 VERIFIABLE PIPELINE FRONTEND
-// MJPEG raw frames → <canvas>, SSE detection data → per-stage rendering.
-// Every pipeline step (Raw / Objects / Plates / OCR / Tracking) is rendered
-// independently on a clickable canvas. Boxes are hit-tested → detail modal.
+// VIDEO ANALYTICS ANPR FRS — v5 VERIFIABLE PIPELINE FRONTEND
+//
+// Architecture: MJPEG raw frames → hidden <img> → <canvas>; SSE detection
+// events drive independent per-stage rendering (Raw / Objects / Plates /
+// OCR / Tracking / All). Boxes are hit-tested → detail modal. Uploads run
+// through /api/detect + /api/detect_video and open a per-track audit trail
+// (/api/track_details) with character-level voting evidence.
 // ==========================================================================
+
+"use strict";
 
 const $ = (id) => document.getElementById(id);
 
-// --- Global state ---
+// --- Global state ---------------------------------------------------------
 const state = {
+    // live session
     sessionId: null,
     mjpegUrl: null,
     eventsUrl: null,
     stopUrl: null,
     eventSource: null,
-    busy: false,
-    // Live track snapshots keyed by track_id per category
-    vehicles: new Map(),
-    plates: new Map(),
-    persons: new Map(),
-    // v4: raw per-frame detections from SSE (for canvas rendering)
-    cocoDets: [],      // current frame COCO detections
-    plateDets: [],     // current frame plate detections
-    personDets: [],    // current frame person detections
-    trajectories: {},  // { track_id: [[frame_idx, cx, cy], ...] } accumulated client-side
-    timing: null,      // {coco_ms, plate_ms, ocr_ms, total_ms, ocr_fired}
-    frameSize: [0, 0],
-    // v4: active pipeline stage
-    activeStage: "raw",
-    // v4: hidden <img> to receive MJPEG stream, drawn to canvas
     mjpegImg: null,
-    // v4: canvas + ctx
+    busy: false,
+    activeStage: "raw",
+
+    // per-frame detection snapshots (canvas rendering)
+    cocoDets: [],
+    framePlates: [],           // plates visible in the CURRENT frame only
+    trajectories: new Map(),   // track_id -> [{frame, cx, cy}, …] insertion-ordered
+
+    // CUMULATIVE session history — every track ever seen stays until the
+    // next Start. Ordered by first appearance so DOM rows never reshuffle.
+    history: [],               // [{key, kind, trackId, …evidence}]
+    historyIdx: new Map(),     // key -> record
+
+    // canvas
     canvas: null,
     ctx: null,
-    // v4: hovered box for highlight
-    hoveredBox: null,
-    // Benchmark data
-    benchmark: null,
+    hoveredKey: null,
 };
 
-const VEHICLE_EMOJI = {
-    bicycle: "🚲",
-    car: "🚗",
-    motorcycle: "🏍️",
-    bus: "🚌",
-    truck: "🚚",
+const VEHICLE_ICONS = { bicycle: "i-car", car: "i-car", motorcycle: "i-car", bus: "i-car", truck: "i-car" };
+void VEHICLE_ICONS; // reserved for per-class icons on cards
+
+// Canvas palette — mirrors the CSS stage identity colors
+const C = {
+    vehicle: "#fbbf24",
+    person: "#38bdf8",
+    plateOk: "#34d399",
+    plateBad: "#f87171",
+    trajLine: "#a78bfa",
+    trajDot: "#f59e0b",
+    trackText: "#a78bfa",
 };
 
-// Colors for each pipeline stage (canvas drawing)
-const STAGE_COLORS = {
-    objects: { vehicle: "#ff8c00", person: "#00a5ff", text: "#ff8c00" },
-    plates: { box: "#00ff00", boxInvalid: "#ff0000", text: "#00ff00" },
-    ocr: { box: "#00ff00", textOk: "#00ff00", textBad: "#ff4444", text: "#ffff00" },
-    tracking: { line: "#00a5ff", dot: "#ff8c00", text: "#00a5ff" },
-};
+function escapeHtml(s) {
+    return (s ?? "").toString().replace(/[&<>"']/g, (c) => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+    })[c]);
+}
 
+function icon(name, cls = "") {
+    return `<svg class="ic ${cls}"><use href="#${name}"/></svg>`;
+}
+
+// ==========================================================================
+// Console panel (capped)
+// ==========================================================================
 function log(...args) {
     const line = args.map(a => typeof a === "string" ? a : JSON.stringify(a)).join(" ");
     const el = $("console-log");
     if (el) {
         const t = new Date().toLocaleTimeString();
-        el.innerHTML += `<div><span class="ts">${t}</span> ${escapeHtml(line)}</div>`;
+        const cls = /error|failed|⚠/i.test(line) ? "err" : (/✓|ok\b|done/i.test(line) ? "ok" : "");
+        const div = document.createElement("div");
+        div.innerHTML = `<span class="ts">${t}</span><span class="${cls}">${escapeHtml(line)}</span>`;
+        el.appendChild(div);
+        while (el.childElementCount > 250) el.removeChild(el.firstChild);
         el.scrollTop = el.scrollHeight;
     }
-    console.log("[live]", ...args);
-}
-
-function escapeHtml(s) {
-    return (s ?? "").toString().replace(/[&<>"']/g, c => ({
-        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
-    })[c]);
+    console.log("[anpr]", ...args);
 }
 
 // ==========================================================================
 // Init
 // ==========================================================================
 document.addEventListener("DOMContentLoaded", () => {
-    setupHealth();
-    setupSourcePicker();
-    setupControlDeck();
-    setupStageTabs();
     setupCanvas();
+    setupStageTabs();
     setupResultsTabs();
     setupDetailModal();
+    setupAuditModal();
     setupBenchmark();
+    setupModeToggle();
+    setupUploadTabs();
+    setupImageUpload();
+    setupVideoUpload();
 
-    log("Dashboard v4 loaded. Pick a source and click ▶ Start Live.");
-    refreshSources();
+    $("btn-start").addEventListener("click", startLive);
+    $("btn-stop").addEventListener("click", stopLive);
+    $("btn-pause").addEventListener("click", togglePause);
+    $("btn-refresh-sources").addEventListener("click", refreshSources);
+    $("upload-results-clear").addEventListener("click", resetUploadResults);
+
     checkHealth();
     setInterval(checkHealth, 5000);
+    refreshSources();
+    log("Dashboard v5 loaded — pick a source and press Start live.");
 });
 
 // ==========================================================================
-// Health
+// Health + compute-device chip
 // ==========================================================================
 async function checkHealth() {
     try {
         const r = await fetch("/health/full");
         const d = await r.json();
-        $("health-dot").classList.add("ready");
-        $("health-dot").classList.remove("error");
-        $("health-text").textContent = `Pipeline ready · ${d.cached_models?.length ?? 0} models cached`;
+        const dot = $("health-dot");
+        dot.classList.remove("ready", "warn", "error");
+        if (!d.awiros_loaded) {
+            dot.classList.add("warn");
+            $("health-text").textContent = "Degraded — OCR model not loaded";
+        } else {
+            dot.classList.add("ready");
+            $("health-text").textContent = `Pipeline ready · ${d.cached_models?.length ?? 0} models cached`;
+        }
+        if (d.device) $("device-text").textContent = d.device;
         $("footer-status").textContent = "ONLINE";
-    } catch (e) {
-        $("health-dot").classList.add("error");
-        $("health-dot").classList.remove("ready");
+    } catch {
+        const dot = $("health-dot");
+        dot.classList.remove("ready", "warn");
+        dot.classList.add("error");
         $("health-text").textContent = "Pipeline offline";
         $("footer-status").textContent = "OFFLINE";
     }
 }
-
-function setupHealth() { }
 
 // ==========================================================================
 // Source picker
@@ -132,52 +156,44 @@ async function refreshSources() {
             const opt = document.createElement("option");
             opt.value = s.path;
             opt.textContent = s.kind === "camera"
-                ? `🎥 ${s.name}`
-                : `📁 ${s.name} (${s.size_mb} MB)`;
+                ? `Webcam (index 0)`
+                : `${s.name} · ${s.size_mb} MB`;
             sel.appendChild(opt);
         }
-        log(`Loaded ${d.sources.length} sources from ${d.sample_videos_dir}`);
+        log(`Loaded ${d.sources.length} source(s) from ${d.sample_videos_dir}`);
     } catch (e) {
         log("refreshSources failed:", e.message);
     }
 }
 
-function setupSourcePicker() {
-    $("btn-refresh-sources").addEventListener("click", refreshSources);
-}
-
 // ==========================================================================
-// Control deck (start / stop)
+// Live session lifecycle
 // ==========================================================================
-function setupControlDeck() {
-    $("btn-start").addEventListener("click", startLive);
-    $("btn-stop").addEventListener("click", stopLive);
-}
-
 async function startLive() {
     if (state.busy) return;
     state.busy = true;
-    $("btn-start").disabled = true;
+    setBtnBusy($("btn-start"), true);
 
     let source = $("source-url").value.trim();
     if (!source) source = $("source-select").value;
     if (!source) {
-        log("ERROR: pick a source or paste a URL");
+        log("ERROR: pick a sample or paste a RTSP/HTTP URL.");
         state.busy = false;
-        $("btn-start").disabled = false;
+        setBtnBusy($("btn-start"), false);
         return;
     }
 
     const body = {
-        source: source,
-        target_fps: parseInt($("target-fps").value || "15"),
+        source,
+        target_fps: Math.min(30, Math.max(1, parseInt($("target-fps").value || "15", 10))),
         model_coco: $("model-coco").value,
         model_plate: $("model-plate").value,
         ocr_on_best_only: $("ocr-strategy").value === "best",
+        best_crop_algo: $("crop-algo").value,
         loop: $("loop-toggle").checked,
     };
 
-    log(`Starting live session: source=${source} models=(${body.model_coco}, ${body.model_plate})`);
+    log(`Starting session — source=${source} · models=(${body.model_coco} / ${body.model_plate}) · ocr=${body.ocr_on_best_only ? "best-crop" : "every-frame"} · criterion=${body.best_crop_algo}`);
 
     try {
         const r = await fetch("/api/live/start", {
@@ -194,29 +210,30 @@ async function startLive() {
         state.mjpegUrl = d.mjpeg_url;
         state.eventsUrl = d.events_url;
         state.stopUrl = d.stop_url;
+
+        resetLiveBuffers();          // fresh session → fresh history
+        state.paused = false;
+        setPauseUi(false);
         $("meta-session").textContent = `session ${state.sessionId.slice(0, 6)}…`;
         $("btn-stop").disabled = false;
-
-        // v4: hide empty state, set up MJPEG → hidden img → canvas
+        hideStreamAlert();
         $("viewport-overlay-empty").classList.add("hidden");
+
+        // MJPEG → hidden img → canvas
         if (!state.mjpegImg) {
             state.mjpegImg = new Image();
-            state.mjpegImg.onload = () => {
-                // When MJPEG frame loads, draw it to canvas with active stage annotations
-                drawCanvas();
-            };
+            state.mjpegImg.onload = drawCanvas;
         }
         state.mjpegImg.src = state.mjpegUrl + "?t=" + Date.now();
 
-        // Connect SSE
         openEventSource();
-
-        log(`Live session ${state.sessionId} started — MJPEG + SSE connected`);
+        log(`Session ${state.sessionId} started — MJPEG + SSE connected.`);
     } catch (e) {
         log("startLive failed:", e.message);
+        showStreamAlert(e.message);
     } finally {
         state.busy = false;
-        $("btn-start").disabled = false;
+        setBtnBusy($("btn-start"), false);
     }
 }
 
@@ -224,39 +241,75 @@ async function stopLive() {
     if (!state.sessionId) return;
     log("Stopping live session…");
     try {
-        if (state.eventSource) {
-            state.eventSource.close();
-            state.eventSource = null;
-        }
-        if (state.mjpegImg) {
-            state.mjpegImg.src = "";
-        }
-        $("viewport-overlay-empty").classList.remove("hidden");
-
+        if (state.eventSource) { state.eventSource.close(); state.eventSource = null; }
+        if (state.mjpegImg) state.mjpegImg.src = "";
         await fetch(state.stopUrl, { method: "POST" });
-        log("Live session stopped");
+        log(`Live session stopped — ${state.history.length} tracks kept in the results panel.`);
     } catch (e) {
         log("stopLive failed:", e.message);
     } finally {
         state.sessionId = null;
         state.mjpegUrl = null;
         state.eventsUrl = null;
-        state.cocoDets = [];
-        state.plateDets = [];
-        state.personDets = [];
-        state.trajectories = {};
-        state.timing = null;
-        $("meta-session").textContent = "no session";
+        // NOTE: history is deliberately NOT cleared here — accumulated
+        // results persist until the next Start begins a new session.
+        $("meta-session").textContent = "session ended";
         $("btn-stop").disabled = true;
-        // Clear canvas
-        if (state.ctx) {
+        state.paused = false;
+        setPauseUi(false);
+        $("viewport-overlay-empty").classList.remove("hidden");
+        if (state.ctx && state.canvas) {
             state.ctx.clearRect(0, 0, state.canvas.width, state.canvas.height);
         }
     }
 }
 
+// ---------------------------------------------------------------------------
+// Pause / resume — freezes server-side processing; viewport holds last frame
+// ---------------------------------------------------------------------------
+async function togglePause() {
+    if (!state.sessionId) return;
+    const target = !state.paused;
+    try {
+        const r = await fetch(`/api/live/pause/${state.sessionId}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ paused: target }),
+        });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        state.paused = target;
+        setPauseUi(target);
+        log(target ? "Paused — pipeline frozen at current frame." : "Resumed.");
+    } catch (e) {
+        log("Pause failed:", e.message);
+    }
+}
+
+function setPauseUi(paused) {
+    const btn = $("btn-pause");
+    btn.disabled = !state.sessionId;
+    $("btn-pause-label").textContent = paused ? "Resume" : "Pause";
+    btn.querySelector("use").setAttribute("href", paused ? "#i-play" : "#i-pause");
+    btn.title = paused ? "Resume processing" : "Freeze processing — the viewport holds its last frame";
+}
+
+function resetLiveBuffers() {
+    // New session: wipe cumulative history + DOM rows + counters.
+    state.cocoDets = [];
+    state.framePlates = [];
+    state.trajectories.clear();
+    state.history = [];
+    state.historyIdx.clear();
+    state.hoveredKey = null;
+    for (const id of ["vehicles-list", "plates-list", "persons-list"]) {
+        $(id).innerHTML = `<p class="empty">No ${id.startsWith("vehicles") ? "vehicles" : id.startsWith("plates") ? "plates" : "persons"} tracked yet.</p>`;
+    }
+    ["sum-vehicles", "sum-valid-plates", "sum-plates", "sum-persons",
+     "tab-count-vehicles", "tab-count-plates", "tab-count-persons"].forEach(id => $(id).textContent = "0");
+}
+
 // ==========================================================================
-// SSE — receive detection events
+// SSE
 // ==========================================================================
 function openEventSource() {
     if (!state.eventsUrl) return;
@@ -265,367 +318,274 @@ function openEventSource() {
     state.eventSource = es;
 
     es.addEventListener("frame", (e) => {
-        try {
-            const data = JSON.parse(e.data);
-            handleFrameEvent(data);
-        } catch (err) {
-            log("bad frame event:", err.message);
-        }
+        try { handleFrameEvent(JSON.parse(e.data)); }
+        catch (err) { log("bad frame event:", err.message); }
     });
     es.addEventListener("end", () => {
-        log("Server signaled end of stream");
+        log("Server signaled end of stream.");
         stopLive();
     });
+    es.addEventListener("error", (e) => {
+        let msg = "Pipeline error";
+        try { msg = JSON.parse(e.data).message || msg; } catch { /* keep default */ }
+        log("Pipeline error:", msg);
+        showStreamAlert(msg);
+    });
     es.onerror = () => {
-        log("SSE connection error");
+        // EventSource auto-reconnects while the session exists; a dead
+        // session ends with an explicit "end" event instead.
+        log("SSE connection interrupted — retrying…");
     };
 }
 
-function handleFrameEvent(d) {
-    // Update meta chips
-    if (typeof d.fps === "number") {
-        $("meta-fps").textContent = `fps ${d.fps.toFixed(1)}`;
-    }
-    $("meta-frame").textContent = `frame ${d.frame_index}`;
+function showStreamAlert(msg) {
+    $("stream-alert-text").textContent = msg;
+    $("stream-alert").classList.remove("hidden");
+}
+function hideStreamAlert() {
+    $("stream-alert").classList.add("hidden");
+}
 
-    // v4: frame size
+function handleFrameEvent(d) {
+    hideStreamAlert();
+    if (typeof d.fps === "number") $("meta-fps").textContent = `fps ${d.fps.toFixed(1)}`;
+    $("meta-frame").textContent = `frame ${d.frame_index}`;
     if (d.frame_size) {
-        state.frameSize = d.frame_size;
         $("meta-size").textContent = `${d.frame_size[0]} × ${d.frame_size[1]}`;
     }
 
-    // v4: timing bar
+    // timing bar — proportional fill + readout + HUD text
     if (d.timing) {
-        state.timing = d.timing;
-        $("timing-coco").textContent = `${d.timing.coco_ms} ms`;
-        $("timing-plate").textContent = `${d.timing.plate_ms} ms`;
-        $("timing-ocr").textContent = d.timing.ocr_ms > 0 ? `${d.timing.ocr_ms} ms` : "—";
-        $("timing-total").textContent = `${d.timing.total_ms} ms`;
-        $("timing-ocr-fired").textContent = d.timing.ocr_fired ? "✓ yes" : "—";
+        const t = d.timing;
+        const total = Math.max(t.total_ms || 1, 1);
+        setSeg("fill-coco", t.coco_ms, total, `${t.coco_ms} ms`);
+        setSeg("fill-plate", t.plate_ms, total, `${t.plate_ms} ms`);
+        setSeg("fill-ocr", t.ocr_ms, total, t.ocr_ms > 0 ? `${t.ocr_ms} ms` : "—");
+        $("timing-total").textContent = `${t.total_ms} ms`;
+        $("timing-ocr-fired").textContent = t.ocr_fired ? "✓" : "—";
+        state.hudText = true;
+    } else {
+        state.hudText = false;
     }
 
-    // v4: raw per-frame detections for canvas rendering
+    // raw per-frame detections (canvas rendering)
     state.cocoDets = d.coco_detections || [];
-    state.plateDets = d.plate_detections || [];
-    state.personDets = d.person_detections || [];
+    state.framePlates = (d.plates || []).filter(p => p.bbox_xyxy);
 
-    // v4: accumulate trajectory points client-side.
-    // Server sends only the last 3 points per track to keep payload small;
-    // we merge them into our client-side trajectory history.
-    const incomingTraj = d.trajectories || {};
-    for (const [tid, points] of Object.entries(incomingTraj)) {
-        if (!state.trajectories[tid]) state.trajectories[tid] = [];
-        const existing = state.trajectories[tid];
-        const lastFrame = existing.length > 0 ? existing[existing.length - 1][0] : 0;
+    // accumulate trajectory history client-side (server sends last 3 points)
+    for (const [tidRaw, points] of Object.entries(d.trajectories || {})) {
+        const tid = Number(tidRaw);
+        if (!state.trajectories.has(tid)) state.trajectories.set(tid, []);
+        const hist = state.trajectories.get(tid);
+        const lastFrame = hist.length ? hist[hist.length - 1].frame : 0;
         for (const pt of points) {
-            if (pt[0] > lastFrame) existing.push(pt);
+            if (pt[0] > lastFrame) hist.push({ frame: pt[0], cx: pt[1], cy: pt[2] });
         }
-        // Cap at 40 points per track to avoid unbounded growth
-        if (existing.length > 40) {
-            state.trajectories[tid] = existing.slice(-40);
-        }
+        if (hist.length > 40) state.trajectories.set(tid, hist.slice(-40));
     }
-    // Cap total number of tracked trajectory keys to avoid memory bloat
-    const trajKeys = Object.keys(state.trajectories);
-    if (trajKeys.length > 100) {
-        // Delete oldest half
-        for (const k of trajKeys.slice(0, 50)) {
-            delete state.trajectories[k];
-        }
+    if (state.trajectories.size > 120) {
+        const excess = state.trajectories.size - 100;
+        for (const k of [...state.trajectories.keys()].slice(0, excess)) state.trajectories.delete(k);
     }
 
-    // Replace track snapshots (for card lists)
-    state.vehicles.clear();
-    for (const v of d.vehicles || []) state.vehicles.set(v.track_id, v);
-    state.plates.clear();
-    for (const p of d.plates || []) state.plates.set(p.track_id, p);
-    state.persons.clear();
-    for (const p of d.persons || []) state.persons.set(p.track_id, p);
+    // CUMULATIVE upsert — merge this frame's tracks into session history.
+    // Records are created once, updated in place, and never dropped on stop.
+    for (const v of d.vehicles || []) upsertRecord("vehicle", v);
+    for (const p of d.persons || []) upsertRecord("person", p);
+    for (const p of d.plates || []) upsertRecord("plate", p);
+    trimHistory();
+    syncCards();
+}
 
-    // Update summary
-    const validPlates = [...state.plates.values()].filter(p => p.valid).length;
-    $("sum-vehicles").textContent = state.vehicles.size;
-    $("sum-valid-plates").textContent = validPlates;
-    $("sum-plates").textContent = state.plates.size;
-    $("sum-persons").textContent = state.persons.size;
-    $("tab-count-vehicles").textContent = state.vehicles.size;
-    $("tab-count-plates").textContent = state.plates.size;
-    $("tab-count-persons").textContent = state.persons.size;
-
-    // Re-render card lists
-    renderVehicleCards();
-    renderPlateCards();
-    renderPersonCards();
-
-    // v4: draw canvas with active stage (MJPEG img.onload also triggers this,
-    // but SSE data may arrive before/after the frame — redraw on data update too)
-    drawCanvas();
+function setSeg(id, valueMs, totalMs, label) {
+    const el = $(id);
+    el.style.width = `${Math.min(100, (valueMs / totalMs) * 100)}%`;
+    el.title = label;
+    const outId = { "fill-coco": "timing-coco", "fill-plate": "timing-plate", "fill-ocr": "timing-ocr" }[id];
+    $(outId).textContent = label;
 }
 
 // ==========================================================================
-// v4: Canvas setup + drawing
+// Canvas — per-stage rendering + hit testing
 // ==========================================================================
 function setupCanvas() {
     state.canvas = $("live-canvas");
     state.ctx = state.canvas.getContext("2d");
 
-    // Click handler — hit-test boxes and open detail modal
     state.canvas.addEventListener("click", (e) => {
-        const rect = state.canvas.getBoundingClientRect();
-        const x = (e.clientX - rect.left) * (state.canvas.width / rect.width);
-        const y = (e.clientY - rect.top) * (state.canvas.height / rect.height);
-        const hit = hitTest(x, y);
-        if (hit) {
-            if (hit.kind === "vehicle") openVehicleDetail(hit.track_id);
-            else if (hit.kind === "plate") openPlateDetail(hit.track_id);
-            else if (hit.kind === "person") openPersonDetail(hit.track_id);
-        }
+        const hit = hitTest(canvasPoint(e));
+        if (!hit) return;
+        if (hit.kind === "vehicle") openVehicleDetail(hit.track_id);
+        else if (hit.kind === "plate") openPlateDetail(hit.track_id);
+        else openPersonDetail(hit.track_id);
     });
 
-    // Mouse move — hover highlight
     state.canvas.addEventListener("mousemove", (e) => {
-        const rect = state.canvas.getBoundingClientRect();
-        const x = (e.clientX - rect.left) * (state.canvas.width / rect.width);
-        const y = (e.clientY - rect.top) * (state.canvas.height / rect.height);
-        const hit = hitTest(x, y);
+        const hit = hitTest(canvasPoint(e));
+        const key = hit ? `${hit.kind}:${hit.track_id}` : null;
         state.canvas.style.cursor = hit ? "pointer" : "default";
-        if (hit !== state.hoveredBox) {
-            state.hoveredBox = hit;
+        if (key !== state.hoveredKey) {           // redraw only on real change
+            state.hoveredKey = key;
             drawCanvas();
         }
     });
 
     state.canvas.addEventListener("mouseleave", () => {
-        state.hoveredBox = null;
+        if (state.hoveredKey !== null) {
+            state.hoveredKey = null;
+            drawCanvas();
+        }
         state.canvas.style.cursor = "default";
-        drawCanvas();
     });
 }
 
-function drawCanvas() {
-    if (!state.ctx || !state.mjpegImg) return;
-
-    const img = state.mjpegImg;
-    if (!img.naturalWidth || !img.naturalHeight) return;
-
-    // Set canvas size to match image (first frame or on resize)
-    if (state.canvas.width !== img.naturalWidth) {
-        state.canvas.width = img.naturalWidth;
-        state.canvas.height = img.naturalHeight;
-    }
-
-    const ctx = state.ctx;
-    const W = state.canvas.width;
-    const H = state.canvas.height;
-
-    // Always draw the raw frame first
-    ctx.drawImage(img, 0, 0, W, H);
-
-    const stage = state.activeStage;
-
-    // Render the active stage's annotations
-    if (stage === "raw") {
-        // No annotations — just the raw frame
-        return;
-    }
-
-    if (stage === "objects" || stage === "all") {
-        drawObjectsStage(ctx, W, H);
-    }
-
-    if (stage === "plates" || stage === "all") {
-        drawPlatesStage(ctx, W, H);
-    }
-
-    if (stage === "ocr" || stage === "all") {
-        drawOcrStage(ctx, W, H);
-    }
-
-    if (stage === "tracking" || stage === "all") {
-        drawTrackingStage(ctx, W, H);
-    }
-
-    // Draw FPS overlay (top-left, always on when streaming)
-    if (state.timing) {
-        drawFpsOverlay(ctx, W, H);
-    }
+function canvasPoint(e) {
+    const rect = state.canvas.getBoundingClientRect();
+    return {
+        x: (e.clientX - rect.left) * (state.canvas.width / rect.width),
+        y: (e.clientY - rect.top) * (state.canvas.height / rect.height),
+    };
 }
 
-function drawObjectsStage(ctx, W, H) {
-    const colors = STAGE_COLORS.objects;
-    for (const d of state.cocoDets) {
-        const [x1, y1, x2, y2] = d.bbox_xyxy;
-        const isPerson = d.class_name === "person";
-        const color = isPerson ? colors.person : colors.vehicle;
-        const isHovered = state.hoveredBox && state.hoveredBox.track_id === d.track_id && state.hoveredBox.kind === (isPerson ? "person" : "vehicle");
-
-        ctx.strokeStyle = color;
-        ctx.lineWidth = isHovered ? 4 : 2;
-        ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
-
-        // Label background
-        const label = `${d.class_name} #${d.track_id} (${(d.confidence || 0).toFixed(2)})`;
-        ctx.font = "14px 'JetBrains Mono', monospace";
-        const tw = ctx.measureText(label).width;
-        ctx.fillStyle = "rgba(0,0,0,0.7)";
-        ctx.fillRect(x1, Math.max(y1 - 20, 0), tw + 8, 18);
-        ctx.fillStyle = color;
-        ctx.fillText(label, x1 + 4, Math.max(y1 - 6, 12));
+function hitTest({ x, y }) {
+    // plates sit on top of vehicles visually — test them first
+    for (const p of state.framePlates) {
+        if (p.bbox_xyxy && inBox(x, y, p.bbox_xyxy)) return { kind: "plate", track_id: p.track_id };
     }
-}
-
-function drawPlatesStage(ctx, W, H) {
-    const colors = STAGE_COLORS.plates;
-    for (const p of state.plateDets) {
-        const [x1, y1, x2, y2] = p.bbox_xyxy;
-        const valid = p.valid;
-        const color = valid ? colors.box : colors.boxInvalid;
-        const isHovered = state.hoveredBox && state.hoveredBox.track_id === p.track_id && state.hoveredBox.kind === "plate";
-
-        ctx.strokeStyle = color;
-        ctx.lineWidth = isHovered ? 5 : 3;
-        ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
-
-        // Label: plate track id + yolo conf
-        const label = `Plate #${p.track_id} (${(p.confidence || 0).toFixed(2)})`;
-        ctx.font = "13px 'JetBrains Mono', monospace";
-        const tw = ctx.measureText(label).width;
-        ctx.fillStyle = "rgba(0,0,0,0.7)";
-        ctx.fillRect(x1, Math.max(y1 - 18, 0), tw + 8, 16);
-        ctx.fillStyle = color;
-        ctx.fillText(label, x1 + 4, Math.max(y1 - 5, 11));
-
-        // Draw best-bbox (dashed) if different from current
-        if (p.best_frame_count && p.ocr_done) {
-            // indicate OCR was done at best frame
-        }
-    }
-}
-
-function drawOcrStage(ctx, W, H) {
-    const colors = STAGE_COLORS.ocr;
-    for (const p of state.plateDets) {
-        const [x1, y1, x2, y2] = p.bbox_xyxy;
-        const hasText = p.text && p.text.length > 0;
-        const valid = p.valid;
-        const color = valid ? colors.textOk : (hasText ? colors.textBad : colors.box);
-        const isHovered = state.hoveredBox && state.hoveredBox.track_id === p.track_id && state.hoveredBox.kind === "plate";
-
-        // Draw box
-        ctx.strokeStyle = color;
-        ctx.lineWidth = isHovered ? 5 : 3;
-        ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
-
-        // OCR text label below the box
-        const ocrText = hasText ? p.text : (p.ocr_done ? "(empty)" : "OCR pending…");
-        const confText = p.ocr_done ? ` ${(p.ocr_conf || 0).toFixed(2)}` : "";
-        const label = `${ocrText}${confText}`;
-        ctx.font = "bold 16px 'JetBrains Mono', monospace";
-        const tw = ctx.measureText(label).width;
-        const ly = Math.min(y2 + 20, H - 4);
-        ctx.fillStyle = "rgba(0,0,0,0.8)";
-        ctx.fillRect(Math.max(x1, 0), ly - 16, tw + 10, 20);
-        ctx.fillStyle = color;
-        ctx.fillText(label, Math.max(x1 + 4, 2), ly - 2);
-
-        // Valid badge
-        if (valid) {
-            ctx.fillStyle = "#00ff00";
-            ctx.fillText("✓", Math.max(x1 + tw + 14, 0), ly - 2);
-        }
-    }
-}
-
-function drawTrackingStage(ctx, W, H) {
-    const colors = STAGE_COLORS.tracking;
-
-    // Draw trajectory lines for tracks — limit to last 30 active tracks
-    // to avoid drawing 700+ polylines every frame (perf)
-    const trajEntries = Object.entries(state.trajectories).slice(-30);
-
-    for (const [tid, points] of trajEntries) {
-        if (!points || points.length < 2) continue;
-        ctx.strokeStyle = colors.line;
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        for (let i = 0; i < points.length; i++) {
-            const [, cx, cy] = points[i];
-            if (i === 0) ctx.moveTo(cx, cy);
-            else ctx.lineTo(cx, cy);
-        }
-        ctx.stroke();
-
-        // Draw a dot at the last position only
-        const last = points[points.length - 1];
-        if (last) {
-            const [, cx, cy] = last;
-            ctx.fillStyle = colors.dot;
-            ctx.beginPath();
-            ctx.arc(cx, cy, 3, 0, Math.PI * 2);
-            ctx.fill();
-
-            // Label with track ID
-            ctx.font = "11px 'JetBrains Mono', monospace";
-            ctx.fillStyle = "rgba(0,0,0,0.7)";
-            ctx.fillRect(cx + 4, cy - 12, 36, 14);
-            ctx.fillStyle = colors.text;
-            ctx.fillText(`#${tid}`, cx + 6, cy - 1);
-        }
-    }
-
-    // Also draw current bboxes with track IDs (dashed)
-    for (const d of state.cocoDets) {
-        const [x1, y1, x2, y2] = d.bbox_xyxy;
-        const isPerson = d.class_name === "person";
-        ctx.strokeStyle = isPerson ? STAGE_COLORS.objects.person : STAGE_COLORS.objects.vehicle;
-        ctx.lineWidth = 1.5;
-        ctx.setLineDash([4, 4]);
-        ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
-        ctx.setLineDash([]);
-
-        // Track ID label
-        ctx.font = "12px 'JetBrains Mono', monospace";
-        const label = `#${d.track_id}`;
-        ctx.fillStyle = "rgba(0,0,0,0.7)";
-        ctx.fillRect(x1, y1, 36, 16);
-        ctx.fillStyle = colors.text;
-        ctx.fillText(label, x1 + 3, y1 + 12);
-    }
-}
-
-function drawFpsOverlay(ctx, W, H) {
-    const t = state.timing;
-    if (!t) return;
-    const fpsText = $("meta-fps").textContent;
-    const frameText = $("meta-frame").textContent;
-    const label = `${frameText}  ${fpsText}  total=${t.total_ms}ms`;
-    ctx.font = "16px 'JetBrains Mono', monospace";
-    ctx.fillStyle = "rgba(0,0,0,0.7)";
-    ctx.fillRect(8, 6, ctx.measureText(label).width + 12, 22);
-    ctx.fillStyle = "#fff";
-    ctx.fillText(label, 14, 22);
-}
-
-// --- Hit testing for clickable canvas ---
-function hitTest(x, y) {
-    // Check plates first (drawn on top), then vehicles, then persons
-    for (const p of state.plateDets) {
-        const [x1, y1, x2, y2] = p.bbox_xyxy;
-        if (x >= x1 && x <= x2 && y >= y1 && y <= y2) {
-            return { kind: "plate", track_id: p.track_id };
-        }
-    }
-    for (const d of state.cocoDets) {
-        const [x1, y1, x2, y2] = d.bbox_xyxy;
-        if (x >= x1 && x <= x2 && y >= y1 && y <= y2) {
-            return { kind: d.class_name === "person" ? "person" : "vehicle", track_id: d.track_id };
+    for (const det of state.cocoDets) {
+        if (inBox(x, y, det.bbox_xyxy)) {
+            return { kind: det.class_name === "person" ? "person" : "vehicle", track_id: det.track_id };
         }
     }
     return null;
 }
+function inBox(x, y, [x1, y1, x2, y2]) {
+    return x >= x1 && x <= x2 && y >= y1 && y <= y2;
+}
+
+function drawCanvas() {
+    const ctx = state.ctx, img = state.mjpegImg;
+    if (!ctx || !img || !img.naturalWidth || !img.naturalHeight) return;
+
+    // Resize when EITHER dimension changed
+    if (state.canvas.width !== img.naturalWidth || state.canvas.height !== img.naturalHeight) {
+        state.canvas.width = img.naturalWidth;
+        state.canvas.height = img.naturalHeight;
+    }
+
+    const W = state.canvas.width, H = state.canvas.height;
+    ctx.drawImage(img, 0, 0, W, H);
+
+    const stage = state.activeStage;
+    const hovered = state.hoveredKey;
+
+    if (stage === "objects" || stage === "all") drawObjects(ctx, hovered);
+    if (stage === "plates" || stage === "all") drawPlates(ctx, hovered, false);
+    if (stage === "ocr" || stage === "all") drawPlates(ctx, hovered, true);
+    if (stage === "tracking" || stage === "all") drawTracking(ctx);
+
+    if (stage !== "raw" && state.hudText) drawHud(ctx, W, H);
+}
+
+function drawObjects(ctx, hovered) {
+    for (const det of state.cocoDets) {
+        const [x1, y1, x2, y2] = det.bbox_xyxy;
+        const isPerson = det.class_name === "person";
+        const color = isPerson ? C.person : C.vehicle;
+        const key = `${isPerson ? "person" : "vehicle"}:${det.track_id}`;
+        ctx.strokeStyle = color;
+        ctx.lineWidth = hovered === key ? 3.5 : 1.8;
+        ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+        labelBox(ctx, `${det.class_name} #${det.track_id} ${(det.confidence || 0).toFixed(2)}`,
+                 x1, y1, color, 11);
+    }
+}
+
+function drawPlates(ctx, hovered, ocrMode) {
+    for (const p of state.framePlates) {
+        if (!p.bbox_xyxy) continue;
+        const [x1, y1, x2, y2] = p.bbox_xyxy;
+        const hasText = p.text && p.text.length > 0;
+        const color = !p.ocr_done ? "#94a3b8" : (hasText ? (p.valid ? C.plateOk : C.plateBad) : C.plateBad);
+        const key = `plate:${p.track_id}`;
+
+        ctx.strokeStyle = color;
+        ctx.lineWidth = hovered === key ? 4 : 2.6;
+        ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+
+        if (ocrMode) {
+            const ocrText = hasText ? p.text : (p.ocr_done ? "(unreadable)" : "OCR pending…");
+            const confTxt = hasText ? ` ${(p.ocr_conf || 0).toFixed(2)}` : "";
+            const ly = Math.min(y2 + 22, state.canvas.height - 4);
+            labelBox(ctx, `${ocrText}${confTxt}${p.valid ? "  ✓IND" : ""}`,
+                     x1, ly - 18, color, 13, { below: true });        } else {
+            labelBox(ctx, `plate #${p.track_id} ${(p.confidence || 0).toFixed(2)}`, x1, y1, color, 11);
+        }
+    }
+}
+
+function drawTracking(ctx) {
+    // trajectories — most recently updated tracks first
+    const entries = [...state.trajectories.entries()].slice(-30);
+    for (const [tid, pts] of entries) {
+        if (!pts || pts.length < 2) continue;
+        ctx.strokeStyle = C.trajLine;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        pts.forEach((pt, i) => i === 0 ? ctx.moveTo(pt.cx, pt.cy) : ctx.lineTo(pt.cx, pt.cy));
+        ctx.stroke();
+
+        const last = pts[pts.length - 1];
+        ctx.fillStyle = C.trajDot;
+        ctx.beginPath();
+        ctx.arc(last.cx, last.cy, 3.2, 0, Math.PI * 2);
+        ctx.fill();
+        labelBox(ctx, `#${tid}`, last.cx + 4, last.cy - 14, C.trackText, 10, { plainBg: true });
+    }
+    // dashed current boxes with IDs
+    for (const det of state.cocoDets) {
+        const [x1, y1, x2, y2] = det.bbox_xyxy;
+        const color = det.class_name === "person" ? C.person : C.vehicle;
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1.4;
+        ctx.setLineDash([4, 4]);
+        ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+        ctx.setLineDash([]);
+        labelBox(ctx, `#${det.track_id}`, x1, y1, color, 10, { compact: true });
+    }
+}
+
+function labelBox(ctx, text, x, y, color, fontSize, opts = {}) {
+    ctx.font = `${opts.plainBg ? "" : "600 "} ${fontSize}px 'JetBrains Mono', monospace`;
+    const tw = ctx.measureText(text).width;
+    const bx = opts.below ? Math.max(x, 2) : x;
+    const by = opts.below ? y : Math.max(y - 16, 0);
+    if (!opts.plainBg) {
+        ctx.fillStyle = "rgba(4,6,10,0.78)";
+        ctx.fillRect(bx, by, tw + 10, 16);
+    } else {
+        ctx.fillStyle = "rgba(4,6,10,0.55)";
+        ctx.fillRect(bx, by, tw + 8, 14);
+    }
+    ctx.fillStyle = color;
+    ctx.fillText(text, bx + 4, by + 12);
+}
+
+function drawHud(ctx, W, H) {
+    const fps = $("meta-fps").textContent;
+    const frame = $("meta-frame").textContent;
+    const t = $("timing-total").textContent;
+    const txt = `${frame} · ${fps} · Σ ${t}`;
+    ctx.font = "600 12px 'JetBrains Mono', monospace";
+    const tw = ctx.measureText(txt).width;
+    ctx.fillStyle = "rgba(4,6,10,0.72)";
+    ctx.fillRect(W - tw - 26, 8, tw + 18, 24);
+    ctx.fillStyle = "#f2f5fa";
+    ctx.fillText(txt, W - tw - 17, 24);
+}
 
 // ==========================================================================
-// v4: Stage tabs — switch active pipeline stage
+// Stage tabs
 // ==========================================================================
 function setupStageTabs() {
     document.querySelectorAll(".stage-tab").forEach(btn => {
@@ -637,122 +597,7 @@ function setupStageTabs() {
                 b.setAttribute("aria-selected", on ? "true" : "false");
             });
             state.activeStage = stage;
-            log(`Pipeline stage → ${stage}`);
             drawCanvas();
-        });
-    });
-}
-
-// ==========================================================================
-// Card rendering — Vehicles, Plates, Persons
-// ==========================================================================
-function renderVehicleCards() {
-    const root = $("vehicles-list");
-    if (state.vehicles.size === 0) {
-        root.innerHTML = `<p class="empty">No vehicles tracked yet.</p>`;
-        return;
-    }
-    const sorted = [...state.vehicles.values()].sort((a, b) => {
-        if (!!a.plate_valid !== !!b.plate_valid) return a.plate_valid ? -1 : 1;
-        return (b.n_frames || 0) - (a.n_frames || 0);
-    });
-    root.innerHTML = sorted.map(v => {
-        const emoji = VEHICLE_EMOJI[v.class_name] || "🚙";
-        const plateHtml = v.plate_text
-            ? `<div class="plate-readout ${v.plate_valid ? "valid" : "tentative"}">
-                 <span class="plate-text">${escapeHtml(v.plate_text)}</span>
-                 <span class="plate-conf">conf ${(v.plate_conf || 0).toFixed(2)}</span>
-                 ${v.plate_valid ? '<span class="valid-badge">✓ Indian format</span>' : ""}
-               </div>`
-            : `<div class="plate-readout pending">
-                 <span class="plate-text muted">${v.ocr_done ? "(no OCR read)" : "OCR pending…"}</span>
-               </div>`;
-        const bbox = v.bbox_xyxy ? `(${v.bbox_xyxy.join(", ")})` : "";
-        return `<div class="card vehicle-card" data-tid="${v.track_id}" data-kind="vehicle">
-            <div class="card-head">
-                <span class="emoji">${emoji}</span>
-                <span class="card-title">${escapeHtml(v.class_name)} #${v.track_id}</span>
-                <span class="card-conf">yolo ${(v.confidence || 0).toFixed(2)}</span>
-            </div>
-            ${plateHtml}
-            <div class="card-meta">
-                <span>${v.n_frames} frames</span>
-                <span>bbox ${bbox}</span>
-            </div>
-        </div>`;
-    }).join("");
-    root.querySelectorAll(".vehicle-card").forEach(el => {
-        el.addEventListener("click", () => {
-            const tid = parseInt(el.dataset.tid);
-            openVehicleDetail(tid);
-        });
-    });
-}
-
-function renderPlateCards() {
-    const root = $("plates-list");
-    if (state.plates.size === 0) {
-        root.innerHTML = `<p class="empty">No plates tracked yet.</p>`;
-        return;
-    }
-    const sorted = [...state.plates.values()].sort((a, b) => {
-        if (!!a.valid !== !!b.valid) return a.valid ? -1 : 1;
-        return (b.ocr_conf || 0) - (a.ocr_conf || 0);
-    });
-    root.innerHTML = sorted.map(p => {
-        const linked = p.linked_vehicle_id != null
-            ? `<span class="link-badge" title="Associated with vehicle #${p.linked_vehicle_id}">↔ vehicle #${p.linked_vehicle_id}</span>`
-            : "";
-        const valid = p.valid ? "valid" : "tentative";
-        return `<div class="card plate-card" data-tid="${p.track_id}" data-kind="plate">
-            <div class="card-head">
-                <span class="emoji">🔢</span>
-                <span class="card-title">Plate #${p.track_id}</span>
-                <span class="card-conf">yolo ${(p.confidence || 0).toFixed(2)}</span>
-            </div>
-            <div class="plate-readout ${valid}">
-                <span class="plate-text">${p.text ? escapeHtml(p.text) : (p.ocr_done ? "(empty)" : "OCR pending…")}</span>
-                ${p.ocr_done ? `<span class="plate-conf">conf ${(p.ocr_conf || 0).toFixed(2)}</span>` : ""}
-                ${p.valid ? '<span class="valid-badge">✓ Indian format</span>' : ""}
-            </div>
-            <div class="card-meta">
-                <span>${p.n_frames} frames</span>
-                ${linked}
-            </div>
-        </div>`;
-    }).join("");
-    root.querySelectorAll(".plate-card").forEach(el => {
-        el.addEventListener("click", () => {
-            const tid = parseInt(el.dataset.tid);
-            openPlateDetail(tid);
-        });
-    });
-}
-
-function renderPersonCards() {
-    const root = $("persons-list");
-    if (state.persons.size === 0) {
-        root.innerHTML = `<p class="empty">No persons tracked yet.</p>`;
-        return;
-    }
-    const sorted = [...state.persons.values()].sort((a, b) => (b.n_frames || 0) - (a.n_frames || 0));
-    root.innerHTML = sorted.map(p => {
-        return `<div class="card person-card" data-tid="${p.track_id}" data-kind="person">
-            <div class="card-head">
-                <span class="emoji">🚶</span>
-                <span class="card-title">person #${p.track_id}</span>
-                <span class="card-conf">yolo ${(p.confidence || 0).toFixed(2)}</span>
-            </div>
-            <div class="card-meta">
-                <span>${p.n_frames} frames</span>
-                <span>bbox (${(p.bbox_xyxy || []).join(", ")})</span>
-            </div>
-        </div>`;
-    }).join("");
-    root.querySelectorAll(".person-card").forEach(el => {
-        el.addEventListener("click", () => {
-            const tid = parseInt(el.dataset.tid);
-            openPersonDetail(tid);
         });
     });
 }
@@ -769,180 +614,362 @@ function setupResultsTabs() {
                 b.classList.toggle("active", on);
                 b.setAttribute("aria-selected", on ? "true" : "false");
             });
-            document.querySelectorAll(".results-content").forEach(c => {
-                c.classList.toggle("active", c.dataset.tab === tab);
-            });
+            document.querySelectorAll(".results-content").forEach(c =>
+                c.classList.toggle("active", c.dataset.tab === tab));
         });
     });
 }
 
 // ==========================================================================
-// Detail modal — opened from card click or canvas click
+// Track cards
+// ==========================================================================
+function plateReadoutHtml(text, done, conf, valid) {
+    if (!text && !done) {
+        return `<div class="plate-readout"><span class="plate-text muted">OCR pending…</span></div>`;
+    }
+    const cls = valid ? "valid" : "tentative";
+    const confTxt = done ? `<span class="plate-conf">${(conf || 0).toFixed(2)}</span>` : "";
+    const badge = valid ? `<span class="valid-badge">${icon("i-check")}IND</span>` : "";
+    return `<div class="plate-readout ${cls}">
+        <span class="plate-text">${text ? escapeHtml(text) : "(unreadable)"}</span>
+        ${confTxt}${badge}
+    </div>`;
+}
+
+// --- cumulative record model ---------------------------------------------
+const MAX_HISTORY = 500;
+
+const areaOf = (bbox) => bbox ? Math.max(0, bbox[2] - bbox[0]) * Math.max(0, bbox[3] - bbox[1]) : 0;
+
+function upsertRecord(kind, t) {
+    const prefix = kind === "vehicle" ? "v" : kind === "person" ? "s" : "p";
+    const key = `${prefix}:${t.track_id}`;
+    let r = state.historyIdx.get(key);
+    if (!r) {
+        r = {
+            key, kind, trackId: t.track_id,
+            className: t.class_name || (kind === "person" ? "person" : kind === "plate" ? "plate" : "vehicle"),
+            firstSeenMs: Date.now(), lastSeenMs: Date.now(),
+            nFrames: 0, confidence: 0,
+            bboxLast: null, bboxBest: null, _bestArea: 0,
+            ocrDone: false, plateText: "", plateConf: 0, plateValid: false,
+            plateTrackId: null, linkedVehicleId: null,
+            // stage evidence (JPEG dataURLs captured from live MJPEG frames)
+            evRaw: null, evObj: null, _evArea: 0,
+        };
+        state.history.push(r);
+        state.historyIdx.set(key, r);
+    }
+    r.lastSeenMs = Date.now();
+    r.nFrames = Math.max(r.nFrames, t.n_frames || 0);
+    r.confidence = Math.max(r.confidence, t.confidence || 0);
+    if (t.bbox_xyxy) {
+        r.bboxLast = t.bbox_xyxy;
+        const a = areaOf(t.bbox_xyxy);
+        if (a > r._bestArea) { r._bestArea = a; r.bboxBest = t.bbox_xyxy.slice(); }
+    }
+    if (kind === "vehicle") {
+        if (t.ocr_done || t.plate_text) {
+            r.ocrDone = !!t.ocr_done;
+            r.plateText = t.plate_text || "";
+            r.plateConf = t.plate_conf || 0;
+            r.plateValid = !!t.plate_valid;
+        }
+        if (t.plate_track_id != null) r.plateTrackId = t.plate_track_id;
+    } else if (kind === "plate") {
+        r.ocrDone = !!t.ocr_done;
+        if (t.text) r.plateText = t.text;
+        r.plateConf = Math.max(r.plateConf, t.ocr_conf || 0);
+        r.plateValid = !!t.valid;
+        if (t.linked_vehicle_id != null) r.linkedVehicleId = t.linked_vehicle_id;
+    }
+    ensureEvidence(r);
+}
+
+// --- evidence snapshots (Raw / Object-crop / Plate-crop), client-side -----
+let _snapCanvas = null;
+let _rawCache = { url: null, at: 0 };
+
+function snapDataURL(sx, sy, sw, sh, maxW, quality) {
+    const img = state.mjpegImg;
+    if (!img || !img.naturalWidth || !img.naturalHeight || sw < 2 || sh < 2) return null;
+    const x = Math.max(0, Math.round(sx)), y = Math.max(0, Math.round(sy));
+    const w = Math.min(img.naturalWidth - x, Math.round(sw));
+    const h = Math.min(img.naturalHeight - y, Math.round(sh));
+    if (w < 2 || h < 2) return null;
+    const scale = Math.min(1, maxW / w);
+    const cw = Math.max(2, Math.round(w * scale)), ch = Math.max(2, Math.round(h * scale));
+    if (!_snapCanvas) _snapCanvas = document.createElement("canvas");
+    _snapCanvas.width = cw; _snapCanvas.height = ch;
+    const ctx = _snapCanvas.getContext("2d");
+    ctx.drawImage(img, x, y, w, h, 0, 0, cw, ch);
+    try { return _snapCanvas.toDataURL("image/jpeg", quality); } catch { return null; }
+}
+
+function rawSnapshot() {
+    const now = performance.now();
+    if (!_rawCache.url || now - _rawCache.at > 800) {
+        const img = state.mjpegImg;
+        _rawCache.url = (img && img.naturalWidth)
+            ? snapDataURL(0, 0, img.naturalWidth, img.naturalHeight, 900, 0.6) : null;
+        _rawCache.at = now;
+    }
+    return _rawCache.url;
+}
+
+function ensureEvidence(r) {
+    if (!state.mjpegImg || !state.mjpegImg.naturalWidth) return;
+    if (!r.evRaw) r.evRaw = rawSnapshot();
+    const bb = r.bboxBest || r.bboxLast;
+    if (!bb) return;
+    const a = areaOf(bb);
+    if (!r.evObj) {
+        r.evObj = snapDataURL(bb[0], bb[1], bb[2] - bb[0], bb[3] - bb[1], 380, 0.82);
+        r._evArea = a;
+    } else if (a > r._evArea * 1.35) {
+        // upgrade the crop when we've since seen a substantially bigger box
+        const newer = snapDataURL(bb[0], bb[1], bb[2] - bb[0], bb[3] - bb[1], 380, 0.82);
+        if (newer) { r.evObj = newer; r._evArea = a; }
+    }
+}
+
+function trimHistory() {
+    while (state.history.length > MAX_HISTORY) {
+        const old = state.history.shift();
+        state.historyIdx.delete(old.key);
+        document.querySelectorAll(`[data-key="${CSS.escape(old.key)}"]`).forEach(el => el.remove());
+    }
+}
+
+// --- incremental card DOM (stable rows → no flicker, clicks always land) ---
+function updateSummaryCounts() {
+    let vehicles = 0, plates = 0, persons = 0, validPlates = 0;
+    for (const r of state.history) {
+        if (r.kind === "vehicle") vehicles++;
+        else if (r.kind === "person") persons++;
+        else { plates++; if (r.plateValid && r.plateText) validPlates++; }
+    }
+    $("sum-vehicles").textContent = vehicles;
+    $("sum-valid-plates").textContent = validPlates;
+    $("sum-plates").textContent = plates;
+    $("sum-persons").textContent = persons;
+    $("tab-count-vehicles").textContent = vehicles;
+    $("tab-count-plates").textContent = plates;
+    $("tab-count-persons").textContent = persons;
+}
+
+function syncCards() {
+    syncKind("vehicles-list", "vehicle");
+    syncKind("plates-list", "plate");
+    syncKind("persons-list", "person");
+    updateSummaryCounts();
+}
+
+function syncKind(listId, kind) {
+    const root = $(listId);
+    for (const r of state.history) {
+        if (r.kind !== kind) continue;
+        let el = root.querySelector(`[data-key="${CSS.escape(r.key)}"]`);
+        if (!el) {
+            root.querySelector(":scope > .empty")?.remove();
+            el = buildCard(r);
+            root.appendChild(el);           // history order is append-only → stable
+        } else {
+            updateCard(el, r);
+        }
+    }
+}
+
+function buildCard(r) {
+    const el = document.createElement("div");
+    el.className = `tcard tcard-kind-${r.kind}`;
+    el.dataset.key = r.key;
+    const ic = r.kind === "vehicle" ? "i-car" : r.kind === "person" ? "i-person" : "i-plate";
+    const title = r.kind === "vehicle" ? escapeHtml(r.className) : r.kind === "plate" ? "Plate" : "Person";
+    el.innerHTML = `
+        <div class="tcard-head">
+            <svg class="ic"><use href="#${ic}"/></svg>
+            <span class="tcard-title">${title} <span class="mono">#${r.trackId}</span></span>
+            <span class="f-conf tcard-conf"></span>
+        </div>
+        ${r.kind !== "person" ? `<div class="f-plate"></div>` : ""}
+        <div class="tcard-meta"><span class="f-frames"></span><span class="f-link"></span></div>`;
+    el.addEventListener("click", () => openTrackDetail(r.key));
+    el._f = {
+        conf: el.querySelector(".f-conf"),
+        frames: el.querySelector(".f-frames"),
+        plate: el.querySelector(".f-plate"),
+        link: el.querySelector(".f-link"),
+        sig: "",
+    };
+    updateCard(el, r);
+    return el;
+}
+
+function updateCard(el, r) {
+    const f = el._f;
+    f.conf.textContent = `yolo ${(r.confidence || 0).toFixed(2)}`;
+    f.frames.textContent = `${r.nFrames} frames`;
+    if (f.plate) {
+        const hasPlateInfo = r.kind === "plate" || r.ocrDone || r.plateTrackId != null;
+        const sig = `${hasPlateInfo}|${r.plateText}|${r.plateValid}|${(r.plateConf || 0).toFixed(2)}`;
+        if (sig !== f.sig) {
+            f.sig = sig;
+            f.plate.innerHTML = hasPlateInfo
+                ? plateReadoutHtml(r.plateText, r.ocrDone || !!r.plateText, r.plateConf, r.plateValid)
+                : `<div class="plate-readout"><span class="plate-text muted">OCR pending…</span></div>`;
+        }
+    }
+    if (f.link) {
+        f.link.textContent = "";
+        if (r.kind === "plate" && r.linkedVehicleId != null) {
+            f.link.innerHTML = `<span class="link-badge">↔ vehicle #${r.linkedVehicleId}</span>`;
+        } else if (r.kind === "vehicle" && r.plateTrackId != null) {
+            f.link.innerHTML = `<span class="link-badge">↔ plate #${r.plateTrackId}</span>`;
+        }
+    }
+}
+
+// ==========================================================================
+// Detail modal (live tracks)
 // ==========================================================================
 function setupDetailModal() {
     $("detail-modal-close").addEventListener("click", closeDetailModal);
     $("detail-modal").addEventListener("click", (e) => {
         if (e.target.id === "detail-modal") closeDetailModal();
     });
-    document.addEventListener("keydown", (e) => {
-        if (e.key === "Escape" && !$("detail-modal").classList.contains("hidden")) {
-            closeDetailModal();
-        }
-    });
 }
 
-function openDetailModal(title, sub) {
-    $("detail-modal-title").textContent = title;
-    $("detail-modal-sub").textContent = sub || "";
-    $("detail-modal").classList.remove("hidden");
-    $("detail-modal").setAttribute("aria-hidden", "false");
-    // Reset crop area
-    $("detail-best-crop").innerHTML = `<p class="empty">Loading crop…</p>`;
-    $("detail-best-crop-label").textContent = "Best crop (OCR'd at best-bbox frame)";
+function openModal(el) { el.classList.remove("hidden"); el.setAttribute("aria-hidden", "false"); }
+function closeModal(el) { el.classList.add("hidden"); el.setAttribute("aria-hidden", "true"); }
+
+function closeDetailModal() { closeModal($("detail-modal")); }
+
+function chipRow(chips) {
+    return chips.map(([k, v, cls]) =>
+        `<div class="dchip ${cls || ""}">${k}:<b>${v}</b></div>`).join("");
 }
 
-function closeDetailModal() {
-    $("detail-modal").classList.add("hidden");
-    $("detail-modal").setAttribute("aria-hidden", "true");
+function kvRows(rows) {
+    return rows.map(([k, v]) =>
+        `<div class="kv-row"><span>${k}</span><code>${v}</code></div>`).join("");
 }
 
-function openVehicleDetail(tid) {
-    const v = state.vehicles.get(tid);
-    if (!v) return;
-    openDetailModal(`${VEHICLE_EMOJI[v.class_name] || "🚙"} ${v.class_name} #${tid}`,
-                    `Tracked across ${v.n_frames} frames`);
-    const linkedPlate = v.plate_track_id != null ? state.plates.get(v.plate_track_id) : null;
-    $("detail-modal-summary").innerHTML = `
-        <div class="detail-chip">track_id: <b>${tid}</b></div>
-        <div class="detail-chip">class: <b>${escapeHtml(v.class_name)}</b></div>
-        <div class="detail-chip">yolo conf: <b>${(v.confidence || 0).toFixed(3)}</b></div>
-        <div class="detail-chip">frames seen: <b>${v.n_frames}</b></div>
-        <div class="detail-chip">plate track: <b>${v.plate_track_id ?? "(none)"}</b></div>
-        <div class="detail-chip">plate text: <b>${escapeHtml(v.plate_text || "—")}</b></div>
-        <div class="detail-chip">plate valid: <b>${v.plate_valid ? "✓ yes" : "✗ no"}</b></div>
-    `;
-    // v4: trajectory timeline
-    const traj = state.trajectories[tid] || [];
-    $("detail-timeline").innerHTML = `
-        <p class="hint">${traj.length} trajectory points recorded.</p>
-        <p class="hint">OCR runs once per plate track at the best-crop frame (largest bbox area). For full frame-by-frame audit, use <b>Upload → Video</b>.</p>
-    `;
-    $("detail-last-seen").innerHTML = `
-        <div class="kv-row"><span>Last bbox (xyxy):</span> <code>${(v.bbox_xyxy || []).join(", ")}</code></div>
-        <div class="kv-row"><span>Best bbox (xyxy):</span> <code>${(v.best_bbox_xyxy || []).join(", ")}</code></div>
-        <div class="kv-row"><span>Best frame index:</span> <code>${v.best_frame_count ?? "—"}</code></div>
-        <div class="kv-row"><span>OCR done:</span> <code>${v.ocr_done ? "yes" : "no"}</code></div>
-        ${linkedPlate ? `<div class="kv-row"><span>Linked plate text:</span> <code>${escapeHtml(linkedPlate.text || "—")}</code></div>` : ""}
-    `;
-    $("detail-meta").textContent = JSON.stringify(v, null, 2);
+// --- pipeline stage-sequence rendering -------------------------------------
+function stageImg(label, sub, url) {
+    return `<div class="stage-card">
+        <div class="stage-head"><span>${label}</span>${sub ? `<span class="sub">${sub}</span>` : ""}</div>
+        <img src="${url}" alt="${label}">
+    </div>`;
+}
 
-    // v4: fetch best crop if this vehicle has a linked plate track
-    if (v.plate_track_id != null && state.sessionId) {
-        fetchBestCrop(v.plate_track_id);
+function stageOcr(text, conf, valid) {
+    const cls = valid && text ? "ok" : (text ? "warn" : "bad");
+    const verdict = valid && text ? "✓ VALID INDIAN PLATE"
+                  : text ? "⚠ FORMAT REVIEW" : "NO TEXT READ";
+    return `<div class="stage-card">
+        <div class="stage-head"><span>04 · OCR OUTPUT</span><span class="sub">Awiros ANPR</span></div>
+        <div class="ocr-out">
+            <div class="ocr-text ${cls}">${escapeHtml(text || "(no read)")}</div>
+            <div class="ocr-verdict" style="color:var(--${cls === "ok" ? "ok" : cls === "warn" ? "warn" : "bad"})">${verdict}</div>
+            <div class="ocr-sub">ocr conf ${(conf || 0).toFixed(4)} · per-character votes in Upload → Video audit</div>
+        </div>
+    </div>`;
+}
+
+function openTrackDetail(key) {
+    const r = state.historyIdx.get(key);
+    if (!r) return;
+
+    // linked plate record (for vehicles)
+    const plateRec = r.kind === "vehicle" && r.plateTrackId != null
+        ? state.historyIdx.get(`p:${r.plateTrackId}`) : null;
+    const ocrSource = r.kind === "plate" ? r : plateRec;
+
+    if (r.kind === "vehicle") {
+        $("detail-modal-title").innerHTML = `${icon("i-car")} ${escapeHtml(r.className)} #${r.trackId}`;
+        $("detail-modal-sub").textContent = `First seen ${new Date(r.firstSeenMs).toLocaleTimeString()} · last active ${new Date(r.lastSeenMs).toLocaleTimeString()}`;
+    } else if (r.kind === "plate") {
+        $("detail-modal-title").innerHTML = `${icon("i-plate")} Plate #${r.trackId}`;
+        $("detail-modal-sub").textContent = `OCR ${r.ocrDone ? "complete" : "pending"} · first seen ${new Date(r.firstSeenMs).toLocaleTimeString()}`;
     } else {
-        $("detail-best-crop").innerHTML = `<p class="empty">No plate track linked — no crop available.</p>`;
+        $("detail-modal-title").innerHTML = `${icon("i-person")} Person #${r.trackId}`;
+        $("detail-modal-sub").textContent = `Tracked across ${r.nFrames} frames`;
     }
-}
 
-function openPlateDetail(tid) {
-    const p = state.plates.get(tid);
-    if (!p) return;
-    openDetailModal(`🔢 Plate #${tid}`,
-                    `OCR ${p.ocr_done ? "complete" : "pending"} · ${p.n_frames} frames`);
-    $("detail-modal-summary").innerHTML = `
-        <div class="detail-chip">track_id: <b>${tid}</b></div>
-        <div class="detail-chip">yolo conf: <b>${(p.confidence || 0).toFixed(3)}</b></div>
-        <div class="detail-chip">ocr conf: <b>${(p.ocr_conf || 0).toFixed(3)}</b></div>
-        <div class="detail-chip">text: <b>${escapeHtml(p.text || "—")}</b></div>
-        <div class="detail-chip">valid Indian: <b>${p.valid ? "✓ yes" : "✗ no"}</b></div>
-        <div class="detail-chip">linked vehicle: <b>${p.linked_vehicle_id ?? "(none)"}</b></div>
-        <div class="detail-chip">frames seen: <b>${p.n_frames}</b></div>
-    `;
-    $("detail-timeline").innerHTML = `
-        <p class="hint">OCR runs once per plate track, at the best-crop frame
-        (largest bbox area for that track). For frame-by-frame OCR audit +
-        persistent best crops, run the same source through <b>Upload → Video</b>.</p>
-    `;
-    $("detail-last-seen").innerHTML = `
-        <div class="kv-row"><span>Last bbox (xyxy):</span> <code>${(p.bbox_xyxy || []).join(", ")}</code></div>
-        <div class="kv-row"><span>Best bbox (xyxy):</span> <code>${(p.best_bbox_xyxy || []).join(", ")}</code></div>
-        <div class="kv-row"><span>Best frame index:</span> <code>${p.best_frame_count ?? "—"}</code></div>
-        <div class="kv-row"><span>OCR done at:</span> <code>${p.ocr_done ? "best frame" : "—"}</code></div>
-    `;
-    $("detail-meta").textContent = JSON.stringify(p, null, 2);
+    $("detail-modal-summary").innerHTML = chipRow([
+        ["track_id", r.trackId],
+        ...(r.kind !== "person" ? [["frames seen", r.nFrames]] : []),
+        ["yolo conf", (r.confidence || 0).toFixed(3)],
+        ...(r.kind !== "plate" ? [] : [["linked vehicle", r.linkedVehicleId ?? "(none)"]]),
+        ...(r.kind === "vehicle" ? [["plate track", r.plateTrackId ?? "(none)"]] : []),
+        ...(ocrSource ? [
+            ["text", escapeHtml(ocrSource.plateText || "—")],
+            ["ocr conf", (ocrSource.plateConf || 0).toFixed(3)],
+            ["valid indian", ocrSource.plateValid ? "✓ yes" : "✗ no", ocrSource.plateValid ? "ok" : "bad"],
+        ] : []),
+    ]);
 
-    // v4: fetch best crop from backend
-    if (state.sessionId) {
-        fetchBestCrop(tid);
-    } else {
-        $("detail-best-crop").innerHTML = `<p class="empty">No active session — crop not available.</p>`;
+    // ── the verifiable sequence: Raw → Object/Plate → OCR ──
+    const stages = [];
+    if (r.evRaw) stages.push(stageImg("01 · RAW FRAME", "live MJPEG frame", r.evRaw));
+    else stages.push(`<div class="stage-card"><div class="stage-head"><span>01 · RAW FRAME</span></div><div class="placeholder-img"><p class="empty">Frame not captured.</p></div></div>`);
+
+    if (r.kind === "plate") {
+        if (r.evObj) stages.push(stageImg("02 · PLATE CROPPED", `yolo ${(r.confidence || 0).toFixed(2)}`, r.evObj));
+    } else if (r.evObj) {
+        stages.push(stageImg("02 · OBJECT DETECTED", `${escapeHtml(r.className)} · yolo ${(r.confidence || 0).toFixed(2)}`, r.evObj));
+        if (plateRec?.evObj) stages.push(stageImg("03 · PLATE CROPPED", `track #${plateRec.trackId}`, plateRec.evObj));
     }
-}
 
-function openPersonDetail(tid) {
-    const p = state.persons.get(tid);
-    if (!p) return;
-    openDetailModal(`🚶 person #${tid}`, `Tracked across ${p.n_frames} frames`);
-    $("detail-modal-summary").innerHTML = `
-        <div class="detail-chip">track_id: <b>${tid}</b></div>
-        <div class="detail-chip">yolo conf: <b>${(p.confidence || 0).toFixed(3)}</b></div>
-        <div class="detail-chip">frames seen: <b>${p.n_frames}</b></div>
-    `;
-    $("detail-timeline").innerHTML = `<p class="hint">Persons have no OCR pipeline — only COCO detection + tracking.</p>`;
-    $("detail-last-seen").innerHTML = `
-        <div class="kv-row"><span>Last bbox (xyxy):</span> <code>${(p.bbox_xyxy || []).join(", ")}</code></div>
-        <div class="kv-row"><span>Best bbox (xyxy):</span> <code>${(p.best_bbox_xyxy || []).join(", ")}</code></div>
-    `;
-    $("detail-meta").textContent = JSON.stringify(p, null, 2);
-    $("detail-best-crop").innerHTML = `<p class="empty">Persons have no plate crop.</p>`;
-}
-
-// v4: Fetch best crop JPEG from backend and display in modal
-async function fetchBestCrop(plateTrackId) {
-    if (!state.sessionId) return;
-    const url = `/api/live/crop/${state.sessionId}/${plateTrackId}`;
-    try {
-        const r = await fetch(url);
-        if (!r.ok) {
-            const err = await r.json().catch(() => ({}));
-            $("detail-best-crop").innerHTML = `<p class="empty">${escapeHtml(err.error || "Crop not yet captured.")}</p>`;
-            return;
-        }
-        const blob = await r.blob();
-        const objUrl = URL.createObjectURL(blob);
-        $("detail-best-crop").innerHTML = `<img src="${objUrl}" alt="Best plate crop" style="max-width:100%;border-radius:6px;">`;
-    } catch (e) {
-        $("detail-best-crop").innerHTML = `<p class="empty">Error loading crop: ${escapeHtml(e.message)}</p>`;
+    if ((r.kind === "plate" || r.kind === "vehicle") && ocrSource && (ocrSource.ocrDone || ocrSource.plateText)) {
+        stages.push(stageOcr(ocrSource.plateText, ocrSource.plateConf, ocrSource.plateValid));
     }
+
+    $("detail-stage-flow").innerHTML = stages.join(
+        `<svg class="ic stage-arrow"><use href="#i-chev"/></svg>`);
+
+    $("detail-last-seen").innerHTML = kvRows([
+        ["Last bbox (xyxy)", (r.bboxLast || []).join(", ")],
+        ["Best bbox (xyxy)", (r.bboxBest || []).join(", ")],
+        ...(r.kind !== "person" ? [["OCR done", r.ocrDone ? "yes" : "no"]] : []),
+        ...(plateRec ? [["Plate track", `#${plateRec.trackId}`]] : []),
+    ]);
+    const meta = { ...r };
+    delete meta._f; delete meta.evRaw; delete meta.evObj;
+    $("detail-meta").textContent = JSON.stringify(meta, null, 2);
+    openModal($("detail-modal"));
 }
+
+function openVehicleDetail(tid) { openTrackDetail(`v:${tid}`); }
+function openPlateDetail(tid) { openTrackDetail(`p:${tid}`); }
+function openPersonDetail(tid) { openTrackDetail(`s:${tid}`); }
 
 // ==========================================================================
-// Benchmark
+// Benchmark modal
 // ==========================================================================
 function setupBenchmark() {
-    $("btn-benchmark").addEventListener("click", () => {
-        $("benchmark-panel").classList.remove("hidden");
-    });
-    $("btn-benchmark-close").addEventListener("click", () => {
-        $("benchmark-panel").classList.add("hidden");
+    $("btn-benchmark").addEventListener("click", () => openModal($("benchmark-backdrop")));
+    $("btn-benchmark-close").addEventListener("click", () => closeModal($("benchmark-backdrop")));
+    $("benchmark-backdrop").addEventListener("click", (e) => {
+        if (e.target.id === "benchmark-backdrop") closeModal($("benchmark-backdrop"));
     });
     $("btn-benchmark-run").addEventListener("click", runBenchmark);
 }
 
 async function runBenchmark() {
-    $("btn-benchmark-run").disabled = true;
-    $("btn-benchmark-run").textContent = "Running…";
-    log("Benchmark starting (5 measurements × ~warmup × 9 variants)…");
+    const btn = $("btn-benchmark-run");
+    setBtnBusy(btn, true, "Running…");
+    log("Benchmark running — measures every local YOLO variant ×5…");
     try {
         const r = await fetch("/api/live/benchmark");
         const d = await r.json();
         renderBenchmark(d.results || []);
-        log(`Benchmark done — ${d.results.length} variants measured`);
+        log(`Benchmark done — ${(d.results || []).length} rows measured.`);
     } catch (e) {
         log("Benchmark failed:", e.message);
     } finally {
-        $("btn-benchmark-run").disabled = false;
-        $("btn-benchmark-run").textContent = "▶ Run benchmark";
+        setBtnBusy(btn, false);
     }
 }
 
@@ -953,80 +980,86 @@ function renderBenchmark(results) {
         return;
     }
     tbody.innerHTML = results.map(r => {
+        if (r.kind === "frame") {
+            return `<tr><td><b>${escapeHtml(r.name)}</b></td><td>frame</td><td colspan="6" class="hint">${escapeHtml(r.source || "")}</td></tr>`;
+        }
         if (r.error) {
-            return `<tr><td>${r.name}</td><td>${r.kind}</td><td colspan="6" class="err">${escapeHtml(r.error)}</td></tr>`;
+            return `<tr><td>${escapeHtml(r.name)}</td><td>${escapeHtml(r.kind)}</td><td colspan="6" class="err">${escapeHtml(r.error)}</td></tr>`;
         }
-        // v4: verdict column — is this fast enough for live?
         let verdict = "";
-        if (r.kind === "coco" || r.kind === "plate") {
-            const fps = r.max_fps || 0;
-            if (fps >= 10) verdict = `<span class="verdict-good">✓ live-ready</span>`;
-            else if (fps >= 4) verdict = `<span class="verdict-ok">~ borderline</span>`;
-            else verdict = `<span class="verdict-bad">✗ too slow</span>`;
-        } else if (r.kind === "ocr") {
-            const fps = r.max_fps || 0;
-            if (fps >= 5) verdict = `<span class="verdict-good">✓ fast</span>`;
-            else if (fps >= 1) verdict = `<span class="verdict-ok">~ best-crop only</span>`;
-            else verdict = `<span class="verdict-bad">✗ bottleneck</span>`;
-        } else if (r.kind === "tracker") {
-            verdict = `<span class="verdict-good">✓ negligible</span>`;
-        } else if (r.kind === "frame") {
-            return `<tr><td><b>${r.name}</b></td><td>${r.kind}</td><td colspan="6" class="hint">${escapeHtml(r.source || "")}</td></tr>`;
-        }
+        const fps = r.max_fps || 0;
+        if (r.kind === "tracker") verdict = verdictBadge("good", "negligible");
+        else if (r.kind === "ocr")
+            verdict = fps >= 5 ? verdictBadge("good", "fast")
+                    : fps >= 1 ? verdictBadge("ok", "best-crop only")
+                    : verdictBadge("bad", "bottleneck");
+        else
+            verdict = fps >= 10 ? verdictBadge("good", "live-ready")
+                    : fps >= 4 ? verdictBadge("ok", "borderline")
+                    : verdictBadge("bad", "too slow");
+        const num = (v, unit) => `<td class="num">${v ?? "—"}${unit}</td>`;
         return `<tr>
-            <td><b>${r.name}</b></td>
-            <td>${r.kind}</td>
-            <td>${r.min_ms ?? "—"} ms</td>
-            <td>${r.median_ms ?? "—"} ms</td>
-            <td>${r.mean_ms ?? "—"} ms</td>
-            <td>${r.max_ms ?? "—"} ms</td>
-            <td>${r.max_fps ?? "—"} fps</td>
-            <td>${verdict}</td>
+            <td><b>${escapeHtml(r.name)}</b></td><td>${escapeHtml(r.kind)}</td>
+            ${num(r.min_ms, " ms")}${num(r.median_ms, " ms")}${num(r.mean_ms, " ms")}${num(r.max_ms, " ms")}
+            ${num(r.max_fps, " fps")}<td>${verdict}</td>
         </tr>`;
     }).join("");
 }
 
+function verdictBadge(level, label) {
+    return `<span class="verdict verdict-${level}">${label}</span>`;
+}
+
 // ==========================================================================
-// MODE TOGGLE — Live vs Upload
+// Mode toggle + upload tabs
 // ==========================================================================
 function setMode(mode) {
-    document.querySelectorAll(".mode-btn").forEach(b => {
-        b.classList.toggle("active", b.dataset.mode === mode);
-    });
-    if (mode === "live") {
-        $("live-panel").classList.remove("hidden");
-        $("upload-panel").classList.add("hidden");
-    } else {
-        $("live-panel").classList.add("hidden");
-        $("upload-panel").classList.remove("hidden");
-        $("upload-panel").scrollIntoView({ behavior: "smooth", block: "start" });
-    }
-    log(`Mode → ${mode}`);
+    document.querySelectorAll(".mode-btn").forEach(b =>
+        b.classList.toggle("active", b.dataset.mode === mode));
+    $("live-panel").classList.toggle("hidden", mode !== "live");
+    $("upload-panel").classList.toggle("hidden", mode !== "upload");
 }
 
 function setupModeToggle() {
-    document.querySelectorAll(".mode-btn").forEach(btn => {
-        btn.addEventListener("click", () => setMode(btn.dataset.mode));
-    });
+    document.querySelectorAll(".mode-btn").forEach(btn =>
+        btn.addEventListener("click", () => setMode(btn.dataset.mode)));
 }
 
-// ==========================================================================
-// UPLOAD TABS (Image / Video)
-// ==========================================================================
 function setupUploadTabs() {
     document.querySelectorAll(".upload-tab").forEach(btn => {
         btn.addEventListener("click", () => {
             const tab = btn.dataset.uploadTab;
             document.querySelectorAll(".upload-tab").forEach(b => {
-                b.classList.toggle("active", b.dataset.uploadTab === tab);
+                const on = b.dataset.uploadTab === tab;
+                b.classList.toggle("active", on);
+                b.setAttribute("aria-selected", on ? "true" : "false");
             });
-            document.querySelectorAll("[data-upload-tab-pane]").forEach(pane => {
-                pane.classList.toggle("hidden", pane.dataset.uploadTabPane !== tab);
-            });
-            $("upload-results-title").textContent =
-                tab === "image" ? "Image results" : "Video results";
+            document.querySelectorAll("[data-upload-tab-pane]").forEach(pane =>
+                pane.classList.toggle("hidden", pane.dataset.uploadTabPane !== tab));
+            $("upload-results-title").textContent = tab === "image" ? "Image results" : "Video results";
         });
     });
+}
+
+// ==========================================================================
+// Button busy helper
+// ==========================================================================
+function setBtnBusy(btn, busy, label) {
+    if (busy) {
+        btn.dataset.idleHtml = btn.innerHTML;
+        btn.classList.add("is-busy");
+        btn.disabled = true;
+        if (label) {
+            btn.classList.remove("is-busy");
+            btn.innerHTML = `<span class="spinner"></span>${escapeHtml(label)}`;
+            btn.dataset.busyLabel = true;
+        }
+    } else {
+        btn.classList.remove("is-busy");
+        delete btn.dataset.busyLabel;
+        if (btn.dataset.idleHtml) btn.innerHTML = btn.dataset.idleHtml;
+        btn.disabled = false;
+    }
 }
 
 // ==========================================================================
@@ -1034,44 +1067,26 @@ function setupUploadTabs() {
 // ==========================================================================
 let uploadImageFile = null;
 
-function setupImageUpload() {
-    const dz = $("image-dropzone");
-    const input = $("image-file-input");
-    const preview = $("image-preview");
-    const detectBtn = $("image-detect-btn");
-    const clearBtn = $("image-clear-btn");
-    const changeBtn = $("image-change-btn");
-    const content = $("image-dropzone-content");
+function wireDropzone(dzId, inputId, contentId, previewSel, changeBtnId, acceptCheck, sizeFmt) {
+    const dz = $(dzId), input = $(inputId), content = $(contentId);
+    const preview = $(previewSel), changeBtn = $(changeBtnId);
+    const detectBtn = dz.closest(".upload-card")?.querySelector(".btn-primary") ||
+                      dz.parentElement.querySelector(".btn-primary");
 
     function pickFile() { input.click(); }
     dz.addEventListener("click", pickFile);
     changeBtn.addEventListener("click", (e) => { e.stopPropagation(); pickFile(); });
 
-    // Drag-and-drop
-    ["dragenter", "dragover"].forEach(ev => {
-        dz.addEventListener(ev, (e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            dz.classList.add("drag-active");
-        });
-    });
-    ["dragleave", "dragend"].forEach(ev => {
-        dz.addEventListener(ev, (e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            if (e.target === dz) dz.classList.remove("drag-active");
-        });
-    });
+    ["dragenter", "dragover"].forEach(ev =>
+        dz.addEventListener(ev, (e) => { e.preventDefault(); e.stopPropagation(); dz.classList.add("drag-active"); }));
+    ["dragleave", "dragend"].forEach(ev =>
+        dz.addEventListener(ev, (e) => { e.preventDefault(); e.stopPropagation(); if (e.target === dz) dz.classList.remove("drag-active"); }));
     dz.addEventListener("drop", (e) => {
-        e.preventDefault();
-        e.stopPropagation();
+        e.preventDefault(); e.stopPropagation();
         dz.classList.remove("drag-active");
         const f = e.dataTransfer?.files?.[0];
         if (!f) return;
-        if (!f.type.startsWith("image/")) {
-            log(`Rejected dropped file (not an image): ${f.name}`);
-            return;
-        }
+        if (!acceptCheck(f)) { log(`Rejected dropped file (wrong type): ${f.name}`); return; }
         input.files = e.dataTransfer.files;
         input.dispatchEvent(new Event("change"));
     });
@@ -1079,39 +1094,48 @@ function setupImageUpload() {
     input.addEventListener("change", () => {
         const f = input.files[0];
         if (!f) return;
-        uploadImageFile = f;
         const url = URL.createObjectURL(f);
         preview.src = url;
         preview.classList.remove("hidden");
         changeBtn.classList.remove("hidden");
         content.classList.add("hidden");
         detectBtn.disabled = false;
-        clearBtn.disabled = false;
-        log(`Image selected: ${f.name} (${(f.size/1024).toFixed(0)} KB)`);
+        $(dzId.replace("dropzone", "clear-btn")).disabled = false;
+        log(`Selected: ${f.name} (${sizeFmt(f)})`);
+        return f;
     });
 
+    return { dz, input, content, preview, changeBtn, detectBtn };
+}
+
+function setupImageUpload() {
+    const ui = wireDropzone(
+        "image-dropzone", "image-file-input", "image-dropzone-content",
+        "image-preview", "image-change-btn",
+        (f) => f.type.startsWith("image/"),
+        (f) => `${(f.size / 1024).toFixed(0)} KB`
+    );
+    const clearBtn = $("image-clear-btn");
+
+    ui.input.addEventListener("change", () => { uploadImageFile = ui.input.files[0]; });
     clearBtn.addEventListener("click", () => {
         uploadImageFile = null;
-        input.value = "";
-        preview.src = "";
-        preview.classList.add("hidden");
-        changeBtn.classList.add("hidden");
-        content.classList.remove("hidden");
-        detectBtn.disabled = true;
+        ui.input.value = "";
+        ui.preview.src = "";
+        ui.preview.classList.add("hidden");
+        ui.changeBtn.classList.add("hidden");
+        ui.content.classList.remove("hidden");
+        ui.detectBtn.disabled = true;
         clearBtn.disabled = true;
         resetUploadResults();
     });
-
-    detectBtn.addEventListener("click", runImageDetect);
+    ui.detectBtn.addEventListener("click", () => runImageDetect(ui.detectBtn));
 }
 
-async function runImageDetect() {
+async function runImageDetect(btn) {
     if (!uploadImageFile) return;
-    const detectBtn = $("image-detect-btn");
-    detectBtn.disabled = true;
-    detectBtn.textContent = "Running…";
-    log(`POST /api/detect (${uploadImageFile.name})`);
-    showUploadProgress("Analyzing image…");
+    setBtnBusy(btn, true, "Running…");
+    showUploadProgress("Analyzing image through the verifiable pipeline…");
     try {
         const fd = new FormData();
         fd.append("image", uploadImageFile);
@@ -1124,69 +1148,73 @@ async function runImageDetect() {
             throw new Error(err.error || `HTTP ${r.status}`);
         }
         const d = await r.json();
-        log(`Image analysis done — ${d.num_plates} plates, ${d.num_vehicles} vehicles, ${d.num_persons} persons in ${d.elapsed_seconds}s`);
+        log(`Image done — ${d.num_plates} plates (${d.num_valid} valid), ${d.num_vehicles} vehicles, ${d.num_persons} persons · ${d.elapsed_seconds}s`);
         renderImageResults(d);
     } catch (e) {
         log("Image analysis failed:", e.message);
-        showUploadResultsError(e.message);
+        showUploadError(e.message);
     } finally {
-        detectBtn.disabled = false;
-        detectBtn.innerHTML = '<span class="btn-icon">🔍</span><span class="btn-label">Run image analysis</span>';
+        setBtnBusy(btn, false);
     }
 }
 
 function renderImageResults(d) {
-    $("upload-results-empty").classList.add("hidden");
-    $("upload-results-body").classList.remove("hidden");
-    $("upload-results-clear").classList.remove("hidden");
+    showUploadBody();
     const html = `
-        <div class="upload-summary">
-            <div class="summary-card"><div class="summary-num">${d.num_plates}</div><div class="summary-label">Plates</div></div>
-            <div class="summary-card success"><div class="summary-num">${d.num_valid || 0}</div><div class="summary-label">Valid</div></div>
-            <div class="summary-card vehicle"><div class="summary-num">${d.num_vehicles}</div><div class="summary-label">Vehicles</div></div>
-            <div class="summary-card warn"><div class="summary-num">${d.num_persons}</div><div class="summary-label">Persons</div></div>
+        ${summaryTiles([
+            [d.num_plates, "Plates"], [d.num_valid || 0, "Valid"],
+            [d.num_vehicles, "Vehicles"], [d.num_persons, "Persons"],
+        ])}
+        <div class="engine-meta">
+            ${escapeHtml(d.engine.detector_coco)} · ${escapeHtml(d.engine.detector_plate)} · ${escapeHtml(d.engine.ocr)}<br>
+            yolo_coco ${d.inference_ms_yolo_coco}ms · yolo_plate ${d.inference_ms_yolo_plate}ms · ocr ${d.inference_ms_ocr_total}ms · total ${(d.elapsed_seconds * 1000).toFixed(0)}ms
         </div>
-        <div class="upload-meta">
-            ${d.engine.detector_coco} · ${d.engine.detector_plate} · ${d.engine.ocr}<br>
-            yolo_coco: ${d.inference_ms_yolo_coco}ms · yolo_plate: ${d.inference_ms_yolo_plate}ms · ocr: ${d.inference_ms_ocr_total}ms · total: ${(d.elapsed_seconds*1000).toFixed(0)}ms
-        </div>
-        <img class="upload-annotated" src="${d.annotated_url}" alt="annotated image">
-        ${renderPlatesList(d.plates || [])}
-        ${renderVehiclesList(d.vehicles || [])}
+        <img class="result-media" src="${d.annotated_url}" alt="annotated image">
+        ${renderUploadPlates(d.plates || [])}
+        ${renderUploadVehicles(d.vehicles || [])}
     `;
     $("upload-results-body").innerHTML = html;
 }
 
-function renderPlatesList(plates) {
+function renderUploadPlates(plates) {
     if (!plates.length) return "";
-    const items = plates.map((p, i) => {
+    const items = plates.map(p => {
         const ok = p.valid_format || p.readable;
-        return `<div class="upload-track-card" data-plate-idx="${i}">
-            <span class="plate-text">${escapeHtml(p.text || '(empty)')}</span>
-            ${ok ? '<span class="plate-valid">✓ Indian format</span>' : '<span class="plate-invalid">tentative</span>'}
-            <div class="upload-meta">
-                bbox ${(p.bbox_xyxy || []).join(", ")} · yolo ${(p.detection_confidence||0).toFixed(2)} · ocr ${(p.ocr_confidence||0).toFixed(2)}
+        return `<div class="utrack">
+            <div class="utrack-head">
+                <span class="utrack-id mono">${escapeHtml(p.text || "(empty)")}</span>
+                ${ok ? '<span class="badge badge-ok">' + icon("i-check") + 'Indian format</span>'
+                     : '<span class="badge badge-warn">tentative</span>'}
             </div>
-            ${p.crop_url ? `<img class="upload-annotated" src="${p.crop_url}" alt="plate crop">` : ""}
+            <div class="utrack-meta">bbox ${(p.bbox_xyxy || []).join(", ")} · yolo ${(p.detection_confidence || 0).toFixed(2)} · ocr ${(p.ocr_confidence || 0).toFixed(2)}</div>
+            ${p.crop_url ? `<div class="utrack-imgs"><img src="${p.crop_url}" alt="plate crop"></div>` : ""}
         </div>`;
     }).join("");
-    return `<h4 style="margin-top:14px;margin-bottom:6px;font-size:12px;color:var(--text-2);text-transform:uppercase;letter-spacing:0.05em;">Plates (${plates.length})</h4><div class="upload-track-list">${items}</div>`;
+    return sectionBlock(`Plates (${plates.length})`, items);
 }
 
-function renderVehiclesList(vehicles) {
+function renderUploadVehicles(vehicles) {
     if (!vehicles.length) return "";
     const items = vehicles.map(v => {
-        const plateBadge = v.plate && v.plate.text
-            ? `<span class="plate-text">${escapeHtml(v.plate.text)}</span>${v.plate.valid ? '<span class="plate-valid">✓</span>' : '<span class="plate-invalid">?</span>'}`
-            : '<span style="color:var(--text-mute);font-size:11px;">(no plate)</span>';
-        return `<div class="upload-track-card">
-            <b>${escapeHtml(v.class_name)}</b> <span style="color:var(--text-2);font-size:11px;">yolo ${(v.confidence||0).toFixed(2)}</span>
-            · ${plateBadge}
-            <div class="upload-meta">bbox ${(v.bbox_xyxy || []).join(", ")}</div>
-            ${v.crop_url ? `<img class="upload-annotated" src="${v.crop_url}" alt="vehicle crop">` : ""}
+        const pl = v.plate;
+        const badge = pl && pl.text
+            ? `<span class="utrack-id mono">${escapeHtml(pl.text)}</span>${
+               (pl.readable ?? pl.valid)
+                   ? '<span class="badge badge-ok">' + icon("i-check") + '</span>'
+                   : '<span class="badge badge-warn">?</span>'}`
+            : `<span class="tcard-conf">(no plate)</span>`;
+        return `<div class="utrack">
+            <div class="utrack-head">
+                <svg class="ic"><use href="#i-car"/></svg>
+                <span class="utrack-class">${escapeHtml(v.class_name)}</span>
+                <span class="tcard-conf">yolo ${(v.confidence || 0).toFixed(2)}</span>
+                ${badge}
+            </div>
+            <div class="utrack-meta">bbox ${(v.bbox_xyxy || []).join(", ")}</div>
+            ${v.crop_url ? `<div class="utrack-imgs"><img src="${v.crop_url}" alt="vehicle crop"></div>` : ""}
         </div>`;
     }).join("");
-    return `<h4 style="margin-top:14px;margin-bottom:6px;font-size:12px;color:var(--text-2);text-transform:uppercase;letter-spacing:0.05em;">Vehicles (${vehicles.length})</h4><div class="upload-track-list">${items}</div>`;
+    return sectionBlock(`Vehicles (${vehicles.length})`, items);
 }
 
 // ==========================================================================
@@ -1195,96 +1223,43 @@ function renderVehiclesList(vehicles) {
 let uploadVideoFile = null;
 
 function setupVideoUpload() {
-    const dz = $("video-dropzone");
-    const input = $("video-file-input");
-    const preview = $("video-preview");
-    const detectBtn = $("video-detect-btn");
+    const uv = wireDropzone(
+        "video-dropzone", "video-file-input", "video-dropzone-content",
+        "video-preview", "video-change-btn",
+        (f) => f.type.startsWith("video/"),
+        (f) => `${(f.size / 1e6).toFixed(1)} MB`
+    );
     const clearBtn = $("video-clear-btn");
-    const changeBtn = $("video-change-btn");
-    const content = $("video-dropzone-content");
     const stopBtn = $("video-stop-btn");
 
-    function pickFile() { input.click(); }
-    dz.addEventListener("click", pickFile);
-    changeBtn.addEventListener("click", (e) => { e.stopPropagation(); pickFile(); });
-
-    // Drag-and-drop
-    ["dragenter", "dragover"].forEach(ev => {
-        dz.addEventListener(ev, (e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            dz.classList.add("drag-active");
-        });
-    });
-    ["dragleave", "dragend"].forEach(ev => {
-        dz.addEventListener(ev, (e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            if (e.target === dz) dz.classList.remove("drag-active");
-        });
-    });
-    dz.addEventListener("drop", (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        dz.classList.remove("drag-active");
-        const f = e.dataTransfer?.files?.[0];
-        if (!f) return;
-        if (!f.type.startsWith("video/")) {
-            log(`Rejected dropped file (not a video): ${f.name}`);
-            return;
-        }
-        input.files = e.dataTransfer.files;
-        input.dispatchEvent(new Event("change"));
-    });
-
-    input.addEventListener("change", () => {
-        const f = input.files[0];
-        if (!f) return;
-        uploadVideoFile = f;
-        const url = URL.createObjectURL(f);
-        preview.src = url;
-        preview.classList.remove("hidden");
-        changeBtn.classList.remove("hidden");
-        content.classList.add("hidden");
-        detectBtn.disabled = false;
-        clearBtn.disabled = false;
-        log(`Video selected: ${f.name} (${(f.size/1e6).toFixed(1)} MB)`);
-    });
-
+    uv.input.addEventListener("change", () => { uploadVideoFile = uv.input.files[0]; });
     clearBtn.addEventListener("click", () => {
         uploadVideoFile = null;
-        input.value = "";
-        preview.src = "";
-        preview.classList.add("hidden");
-        changeBtn.classList.add("hidden");
-        content.classList.remove("hidden");
-        detectBtn.disabled = true;
+        uv.input.value = "";
+        uv.preview.src = "";
+        uv.preview.classList.add("hidden");
+        uv.changeBtn.classList.add("hidden");
+        uv.content.classList.remove("hidden");
+        uv.detectBtn.disabled = true;
         clearBtn.disabled = true;
         resetUploadResults();
     });
-
-    detectBtn.addEventListener("click", runVideoDetect);
+    uv.detectBtn.addEventListener("click", () => runVideoDetect(uv.detectBtn));
 
     stopBtn.addEventListener("click", async () => {
         stopBtn.disabled = true;
-        stopBtn.textContent = "Stopping…";
-        log("Sending cancel request…");
-        try {
-            await fetch("/api/cancel_video", { method: "POST" });
-        } catch (_) { /* server may be busy in processing loop */ }
+        log("Cancel requested — stopping after current frame…");
+        try { await fetch("/api/cancel_video", { method: "POST" }); }
+        catch { /* processing loop may be blocking; job will exit at next check */ }
     });
 }
 
-async function runVideoDetect() {
+async function runVideoDetect(btn) {
     if (!uploadVideoFile) return;
-    const detectBtn = $("video-detect-btn");
     const stopBtn = $("video-stop-btn");
-    detectBtn.disabled = true;
-    detectBtn.innerHTML = '<span class="spinner"></span><span class="btn-label">Processing…</span>';
+    setBtnBusy(btn, true, "Processing…");
     stopBtn.disabled = false;
-    stopBtn.textContent = "■ Stop";
-    log(`POST /api/detect_video (${uploadVideoFile.name})`);
-    showUploadProgress("Processing video (ByteTrack + Awiros OCR). This may take a minute…");
+    showUploadProgress("ByteTrack + Awiros OCR running — this can take a while (OCR ~2.5 s/crop on CPU). Press Stop to cancel.");
     try {
         const fd = new FormData();
         fd.append("video", uploadVideoFile);
@@ -1300,85 +1275,171 @@ async function runVideoDetect() {
             throw new Error(err.error || `HTTP ${r.status}`);
         }
         const d = await r.json();
-        log(`Video processing done — ${d.n_tracks} tracks, ${d.n_valid_plates} valid plates, ${d.fps_processed} fps in ${d.elapsed_seconds}s`);
+        log(`Video done — ${d.n_tracks} tracks, ${d.n_valid_plates} valid plates · ${d.fps_processed} fps processed · ${d.elapsed_seconds}s`);
         renderVideoResults(d);
     } catch (e) {
         log("Video processing failed:", e.message);
-        showUploadResultsError(e.message);
+        showUploadError(e.message);
     } finally {
-        detectBtn.disabled = false;
-        detectBtn.innerHTML = '<span class="btn-icon">🎬</span><span class="btn-label">Run video tracking</span>';
+        setBtnBusy(btn, false);
         stopBtn.disabled = true;
-        stopBtn.textContent = "■ Stop";
     }
 }
 
 function renderVideoResults(d) {
-    $("upload-results-empty").classList.add("hidden");
-    $("upload-results-body").classList.remove("hidden");
-    $("upload-results-clear").classList.remove("hidden");
+    showUploadBody();
     const tracks = d.tracks || [];
-    const html = `
-        <div class="upload-summary">
-            <div class="summary-card"><div class="summary-num">${d.n_tracks}</div><div class="summary-label">Tracks</div></div>
-            <div class="summary-card success"><div class="summary-num">${d.n_valid_plates}</div><div class="summary-label">Valid plates</div></div>
-            <div class="summary-card vehicle"><div class="summary-num">${d.fps_processed}</div><div class="summary-label">fps processed</div></div>
-            <div class="summary-card time"><div class="summary-num">${d.elapsed_seconds}s</div><div class="summary-label">elapsed</div></div>
+    const videoBlock = d.annotated_video_url ? `
+        <div style="margin-bottom:12px">
+            <video controls class="result-media" src="${d.annotated_video_url}"></video>
+            <a class="btn btn-ghost" href="${d.annotated_video_url}" download="annotated.mp4">
+                ${icon("i-download")}Download annotated video
+            </a>
+        </div>` : "";
+    const items = tracks.map(t => `
+        <div class="utrack">
+            <div class="utrack-head">
+                <span class="utrack-id mono">#${t.track_id}</span>
+                <span class="utrack-class">${escapeHtml(t.class_name || "?")}</span>
+                <span class="tcard-conf">${t.n_frames} frames</span>
+                ${t.final_text
+                    ? `<span class="utrack-id mono">${escapeHtml(t.final_text)}</span>${
+                       t.valid_indian ? '<span class="badge badge-ok">' + icon("i-check") + 'Indian format</span>'
+                                      : '<span class="badge badge-warn">tentative</span>'}`
+                    : '<span class="tcard-conf">(no plate OCR)</span>'}
+            </div>
+            <div class="utrack-meta">
+                final conf ${(t.final_conf || 0).toFixed(2)} · avg yolo ${(t.avg_yolo_conf || 0).toFixed(2)} · unique reads ${t.n_unique_reads}<br>
+                first @ frame ${t.first_seen} → last @ frame ${t.last_seen}
+            </div>
+            ${(t.best_crop_url || t.best_annotated_url || t.vehicle_crop_url) ? `
+            <div class="utrack-imgs">
+                ${t.vehicle_crop_url ? `<img src="${t.vehicle_crop_url}" title="Vehicle at best frame">` : ""}
+                ${t.best_annotated_url ? `<img src="${t.best_annotated_url}" title="Annotated best frame">` : ""}
+                ${t.best_crop_url ? `<img src="${t.best_crop_url}" title="Best plate crop">` : ""}
+            </div>` : ""}
+            <div class="utrack-actions">
+                ${t.audit_url ? `<button class="btn btn-ghost" data-audit-url="${t.audit_url}" data-track="${t.track_id}">
+                    ${icon("i-doc")}Track audit (${t.n_unique_reads} reads)</button>` : ""}
+            </div>
+        </div>`).join("");
+
+    $("upload-results-body").innerHTML = `
+        ${summaryTiles([
+            [d.n_tracks, "Tracks"], [d.n_valid_plates, "Valid plates"],
+            [d.fps_processed, "fps processed"], [`${d.elapsed_seconds}s`, "Elapsed"],
+        ])}
+        <div class="engine-meta">
+            ${escapeHtml(d.engine?.detector_coco || "")} · ${escapeHtml(d.engine?.detector_plate || "")} · ${escapeHtml(d.engine?.ocr || "")}<br>
+            ${d.n_frames_processed}/${d.n_total_frames} frames @ stride ${d.stride} · source ${d.fps} fps · ${escapeHtml(d.tracker)}
         </div>
-        <div class="upload-meta">
-            ${d.engine?.detector_coco || ''} · ${d.engine?.detector_plate || ''} · ${d.engine?.ocr || ''}<br>
-            ${d.n_frames_processed}/${d.n_total_frames} frames @ stride=${d.stride} · ${d.fps} fps source · ${d.tracker}
-        </div>
-        ${d.annotated_video_url ? `<div class="upload-video-wrap">
-            <video controls src="${d.annotated_video_url}"></video>
-            <a class="btn-ghost" href="${d.annotated_video_url}" download="annotated.mp4">⬇ Download annotated.mp4</a>
-        </div>` : ""}
-        ${renderVideoTracksList(tracks, d)}
+        ${videoBlock}
+        ${tracks.length ? sectionBlock(`Tracks (${tracks.length})`, items) : ""}
     `;
-    $("upload-results-body").innerHTML = html;
+    $("upload-results-body").querySelectorAll("[data-audit-url]").forEach(btn =>
+        btn.addEventListener("click", () => openAuditTrail(btn.dataset.auditUrl, btn.dataset.track)));
 }
 
-function renderVideoTracksList(tracks, d) {
-    if (!tracks.length) return "";
-    const items = tracks.map(t => {
-        const valid = t.valid_indian;
-        const plateHtml = t.final_text
-            ? `<span class="plate-text">${escapeHtml(t.final_text)}</span> ${valid ? '<span class="plate-valid">✓ Indian format</span>' : '<span class="plate-invalid">tentative</span>'}`
-            : '<span style="color:var(--text-mute);font-size:11px;">(no plate OCR)</span>';
-        const crop = t.best_crop_url
-            ? `<img class="upload-annotated" src="${t.best_crop_url}" alt="best crop">`
-            : "";
-        const annotated = t.best_annotated_url
-            ? `<img class="upload-annotated" src="${t.best_annotated_url}" alt="best annotated">`
-            : "";
-        const trackUrl = `${d.report_url || ""}/track_${t.track_id}`;
-        return `<div class="upload-track-card" data-track-id="${t.track_id}">
-            <b>#${t.track_id}</b> <span style="color:var(--text-1);">${escapeHtml(t.class_name || '?')}</span>
-            <span style="color:var(--text-2);font-size:11px;">${t.n_frames} frames</span>
-            · ${plateHtml}
-            <div class="upload-meta">
-                final conf ${(t.final_conf||0).toFixed(2)} · avg yolo ${(t.avg_yolo_conf||0).toFixed(2)} · n_unique_reads=${t.n_unique_reads}
-                <br>first @ frame ${t.first_seen} → last @ frame ${t.last_seen}
-            </div>
-            ${crop}
-            ${annotated}
-            ${trackUrl && d.report_url ? `<a class="btn-ghost" href="${trackUrl}" target="_blank">📋 Detailed audit</a>` : ""}
-        </div>`;
-    }).join("");
-    return `<h4 style="margin-top:14px;margin-bottom:6px;font-size:12px;color:var(--text-2);text-transform:uppercase;letter-spacing:0.05em;">Tracks (${tracks.length})</h4><div class="upload-track-list">${items}</div>`;
+// ==========================================================================
+// TRACK AUDIT MODAL (uploaded videos)
+// ==========================================================================
+function setupAuditModal() {
+    $("audit-modal-close").addEventListener("click", () => closeModal($("audit-modal")));
+    $("audit-modal").addEventListener("click", (e) => {
+        if (e.target.id === "audit-modal") closeModal($("audit-modal"));
+    });
+}
+
+async function openAuditTrail(auditUrl, trackHint) {
+    openModal($("audit-modal"));
+    $("audit-modal-title").innerHTML = `${icon("i-doc")} Track audit ${trackHint ? `#${escapeHtml(trackHint)}` : ""}`;
+    $("audit-modal-summary").innerHTML = `<div class="dchip">loading…</div>`;
+    $("audit-votes").innerHTML = "";
+    $("audit-reads").innerHTML = `<p class="empty">Loading reads…</p>`;
+    try {
+        const r = await fetch(auditUrl);
+        if (!r.ok) {
+            const err = await r.json().catch(() => ({}));
+            throw new Error(err.error || `HTTP ${r.status}`);
+        }
+        const t = await r.json();
+        renderAuditTrail(t);
+    } catch (e) {
+        $("audit-modal-summary").innerHTML = "";
+        $("audit-reads").innerHTML = `<p class="empty">Failed to load audit: ${escapeHtml(e.message)}</p>`;
+    }
+}
+
+function renderAuditTrail(t) {
+    $("audit-modal-title").innerHTML =
+        `${icon("i-doc")} Track #${t.track_id} — ${escapeHtml(t.class_name || "vehicle")}`;
+    $("audit-modal-sub").textContent =
+        `Frames ${t.first_seen} → ${t.last_seen} · ${t.n_frames} frames · ${t.n_unique_reads} unique OCR reads`;
+
+    $("audit-modal-summary").innerHTML = chipRow([
+        ["final text", escapeHtml(t.final_text || "—")],
+        ["final conf", (t.final_conf || 0).toFixed(3)],
+        ["valid indian", t.valid_indian ? "✓ yes" : "✗ no", t.valid_indian ? "ok" : "bad"],
+        ["avg yolo", (t.avg_yolo_conf || 0).toFixed(3)],
+        ["best frame", t.best_frame ?? "—"],
+        ["best text", escapeHtml(t.best_text || "—")],
+        ["best conf", (t.best_conf || 0).toFixed(3)],
+    ]);
+
+    // character voting visualization — one cell per position
+    const votes = t.votes_per_pos || {};
+    $("audit-votes").innerHTML = Object.keys(votes).length
+        ? Object.entries(votes).map(([pos, bucket]) => {
+            const entries = Object.entries(bucket).sort((a, b) => b[1] - a[1]);
+            const winner = entries[0];
+            return `<div class="vote-pos" title="${entries.slice(0, 4).map(([ch, sc]) => `${ch}:${sc}`).join("  ")}">
+                <div class="vote-ch">${escapeHtml(winner ? winner[0] : "?")}</div>
+                <div class="vote-score">${winner ? winner[1].toFixed(2) : "—"}</div>
+            </div>`;
+        }).join("")
+        : `<p class="empty">No voting data for this track.</p>`;
+
+    // per-frame reads with crops
+    const reads = t.per_frame_reads || [];
+    $("audit-reads").innerHTML = reads.length
+        ? reads.map(rd => `
+            <div class="read-row">
+                <span class="read-frame">frame ${rd.frame}</span>
+                ${rd.crop_url ? `<img src="${rd.crop_url}" alt="crop @ ${rd.frame}">` : ""}
+                <span class="read-text">${rd.text ? escapeHtml(rd.text) : "(empty)"}</span>
+                <span class="read-conf">ocr ${(rd.ocr_conf ?? 0).toFixed(2)} · yolo ${(rd.yolo_conf ?? 0).toFixed(2)}</span>
+            </div>`).join("")
+        : `<p class="empty">This track produced no plate reads.</p>`;
 }
 
 // ==========================================================================
 // Upload helpers
 // ==========================================================================
-function showUploadProgress(text) {
-    $("upload-results-empty").classList.add("hidden");
-    $("upload-results-body").classList.remove("hidden");
-    $("upload-results-body").innerHTML = `<div class="upload-progress"><span class="spinner"></span>${escapeHtml(text)}</div>`;
+function summaryTiles(items) {
+    return `<div class="upload-summary">${items.map(([num, lbl]) =>
+        `<div class="stat"><div class="stat-num">${num}</div><div class="stat-lbl">${lbl}</div></div>`).join("")}</div>`;
 }
 
-function showUploadResultsError(msg) {
-    $("upload-results-body").innerHTML = `<div class="upload-progress" style="color:var(--red);">⚠ ${escapeHtml(msg)}</div>`;
+function sectionBlock(title, inner) {
+    return `<div class="section-h">${title}</div><div class="track-list">${inner}</div>`;
+}
+
+function showUploadProgress(text) {
+    showUploadBody();
+    $("upload-results-body").innerHTML =
+        `<div class="progress-line"><span class="spinner"></span>${escapeHtml(text)}</div>`;
+}
+
+function showUploadError(msg) {
+    showUploadBody();
+    $("upload-results-body").innerHTML =
+        `<div class="progress-line" style="color:var(--bad)">${icon("i-alert")}${escapeHtml(msg)}</div>`;
+}
+
+function showUploadBody() {
+    $("upload-results-empty").classList.add("hidden");
+    $("upload-results-body").classList.remove("hidden");
+    $("upload-results-clear").classList.remove("hidden");
 }
 
 function resetUploadResults() {
@@ -1388,11 +1449,13 @@ function resetUploadResults() {
     $("upload-results-clear").classList.add("hidden");
 }
 
-// Init on DOMContentLoaded — append to existing init
-document.addEventListener("DOMContentLoaded", () => {
-    setupModeToggle();
-    setupUploadTabs();
-    setupImageUpload();
-    setupVideoUpload();
-    $("upload-results-clear").addEventListener("click", resetUploadResults);
+// ==========================================================================
+// Global keyboard handling — Esc closes the topmost modal
+// ==========================================================================
+document.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape") return;
+    for (const id of ["audit-modal", "detail-modal", "benchmark-backdrop"]) {
+        const el = $(id);
+        if (el && !el.classList.contains("hidden")) { closeModal(el); break; }
+    }
 });

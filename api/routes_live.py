@@ -1,5 +1,5 @@
 """
-Live-stream endpoints for the Traffic Management dashboard.
+Live-stream endpoints for the Video Analytics ANPR FRS dashboard.
 
 Endpoints:
     GET  /api/live/sources                  → list of available sample videos
@@ -11,16 +11,14 @@ Endpoints:
     GET  /api/live/session/<sid>            → current session metadata
 
     All three benchmarks operate on the same representative 1280x720 CCTV
-    frame (a pinned copy at app/static/benchmark_sample.jpg, originally
-    frame 90 of the 1.mp4 sample in the user's CCTV samples dir) so the
-    numbers are directly comparable.
+    frame (a pinned copy at static/benchmark_sample.jpg) so the numbers are
+    directly comparable.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import mimetypes
 import time
 import traceback
 from pathlib import Path
@@ -46,8 +44,9 @@ live_bp = Blueprint("live", __name__)
 HERE = Path(__file__).resolve().parent.parent
 SESSION_MANAGER = LiveSessionManager()
 
-# Default sample-videos directory (overridden by run.py if --sample-videos-dir is set)
-SAMPLE_VIDEOS_DIR = Path(r"C:\Users\harsh\Downloads\cctv samples")
+# Default sample-videos directory (overridden by run.py if --sample-videos-dir is set).
+# Drop .mp4 files into <repo>/sample_videos/ or pass --sample-videos-dir.
+SAMPLE_VIDEOS_DIR = HERE / "sample_videos"
 
 
 def set_sample_videos_dir(path: str):
@@ -63,8 +62,11 @@ def set_sample_videos_dir(path: str):
 def api_live_sources():
     """Return available video sources the user can stream from."""
     out = []
+    extensions = ("*.mp4", "*.avi", "*.mov", "*.mkv", "*.webm")
     if SAMPLE_VIDEOS_DIR.exists():
-        for p in sorted(SAMPLE_VIDEOS_DIR.glob("*.mp4")):
+        for p in sorted(
+            p for ext in extensions for p in SAMPLE_VIDEOS_DIR.glob(ext)
+        ):
             out.append({
                 "name": p.stem,
                 "path": str(p),
@@ -74,7 +76,9 @@ def api_live_sources():
         # also list subfolders (e.g. tests/)
         for sub in sorted(SAMPLE_VIDEOS_DIR.iterdir()):
             if sub.is_dir():
-                for p in sorted(sub.glob("*.mp4")):
+                for p in sorted(
+                    p for ext in extensions for p in sub.glob(ext)
+                ):
                     out.append({
                         "name": f"{sub.name}/{p.stem}",
                         "path": str(p),
@@ -100,33 +104,53 @@ def api_live_start():
         source = body.get("source", "")
         if not source:
             return jsonify(error="Missing 'source' (local path, URL, or '0' for webcam)."), 400
-        target_fps = float(body.get("target_fps", 15.0))
+        try:
+            target_fps = float(body.get("target_fps", 15.0))
+        except (TypeError, ValueError):
+            return jsonify(error="target_fps must be a number."), 400
+        target_fps = min(60.0, max(1.0, target_fps))
         model_coco = body.get("model_coco", "yolo11n")
         model_plate = body.get("model_plate", "yolo11_plate")
         ocr_on_best_only = bool(body.get("ocr_on_best_only", True))
+        best_crop_algo = body.get("best_crop_algo", "area")
         loop = bool(body.get("loop", True))
 
-        # Resolve camera index
-        if source == "0":
-            resolved_source = 0
-        else:
-            resolved_source = source
+        # Resolve camera index — keep it an int so OpenCV opens the device,
+        # not a file literally named "0".
+        resolved_source = 0 if source == "0" else source
+
+        # Restrict file sources to the configured sample-videos dir and URL
+        # sources to expected camera schemes — /api/live/start must not become
+        # an arbitrary local-file reader or internal-network prober.
+        if isinstance(resolved_source, str) and not resolved_source.lower().startswith(
+            ("rtsp://", "http://", "https://")
+        ):
+            src_path = Path(resolved_source).resolve()
+            allowed_root = SAMPLE_VIDEOS_DIR.resolve()
+            try:
+                src_path.relative_to(allowed_root)
+            except ValueError:
+                return jsonify(error=(
+                    "File sources must live inside the sample-videos directory "
+                    f"({allowed_root}). Use a sample video, a webcam index ('0'), "
+                    "or an rtsp/http(s) URL."
+                )), 400
+            if not src_path.exists():
+                return jsonify(error=f"Source not found: {source}"), 404
+            resolved_source = str(src_path)
 
         # Create source
-        live_source = LiveSource(str(resolved_source), target_fps=target_fps, loop=loop)
+        live_source = LiveSource(resolved_source, target_fps=target_fps, loop=loop)
 
-        # Load models — but for the COCO tracker we need a FRESH YOLO instance
-        # per live session so that ByteTrack's `persist=True` state is
-        # isolated. Reusing the engine's cached model would carry the previous
-        # session's tracker state into this one and cause TypeError on the
-        # second `.track()` call.
+        # Build FRESH YOLO instances for this session. ByteTrack's `persist=True`
+        # state lives on the YOLO model object, so sharing the engine's cached
+        # models across concurrent sessions would mix tracker state (and crash
+        # with TypeError on the second `.track()` call after a tracker reset).
         try:
-            from ultralytics import YOLO
-            # Use engine's model loader — it picks OpenVINO GPU models when available
-            yolo_coco = engine._get_yolo_model(model_coco)
-            yolo_plate = engine._get_yolo_model(model_plate)
             engine._ensure_awiros()
             awiros = engine.awiros
+            yolo_coco = engine._build_yolo(model_coco)
+            yolo_plate = engine._build_yolo(model_plate)
         except Exception as e:
             traceback.print_exc()
             return jsonify(error=f"Model load failed: {e}"), 500
@@ -143,6 +167,7 @@ def api_live_start():
             ocr_on_best_only=ocr_on_best_only,
             iou_thresh=0.20,
             device=engine._OPENVINO_DEVICE or "cpu",
+            best_crop_algo=best_crop_algo,
         )
         session = LiveSession(source=live_source, pipeline=pipeline)
         session.meta = {
@@ -151,6 +176,7 @@ def api_live_start():
             "model_coco": model_coco,
             "model_plate": model_plate,
             "ocr_on_best_only": ocr_on_best_only,
+            "best_crop_algo": pipeline.best_crop_algo,
             "loop": loop,
         }
         SESSION_MANAGER.add(sid, session)
@@ -184,11 +210,13 @@ def api_live_mjpeg(sid: str):
 
     def generate():
         # Send an initial empty frame so the <img> tag starts rendering
+        SESSION_MANAGER.stream_open(sid)
         try:
             while True:
                 s = SESSION_MANAGER.get(sid)
                 if s is None:
                     return
+                SESSION_MANAGER.touch(sid)
                 try:
                     jpeg = q.get(timeout=2.0)
                 except Exception:
@@ -200,6 +228,8 @@ def api_live_mjpeg(sid: str):
         except GeneratorExit:
             log.info("MJPEG client disconnected from session %s", sid)
             return
+        finally:
+            SESSION_MANAGER.stream_close(sid)
 
     return Response(
         stream_with_context(generate()),
@@ -219,6 +249,7 @@ def api_live_events(sid: str):
     q = session.pipeline.event_queue()
 
     def generate():
+        SESSION_MANAGER.stream_open(sid)
         last_keepalive = time.time()
         try:
             while True:
@@ -226,6 +257,7 @@ def api_live_events(sid: str):
                 if s is None:
                     yield "event: end\ndata: {}\n\n"
                     return
+                SESSION_MANAGER.touch(sid)
                 try:
                     evt = q.get(timeout=0.5)
                 except Exception:
@@ -243,6 +275,8 @@ def api_live_events(sid: str):
         except GeneratorExit:
             log.info("SSE client disconnected from session %s", sid)
             return
+        finally:
+            SESSION_MANAGER.stream_close(sid)
 
     return Response(
         stream_with_context(generate()),
@@ -272,6 +306,21 @@ def api_live_crop(sid: str, track_id: str):
     if not crop:
         return jsonify(error=f"No best crop cached for plate track {tid}."), 404
     return Response(crop, mimetype="image/jpeg")
+
+
+# ---------------------------------------------------------------------------
+# /api/live/pause/<sid> — freeze/resume frame processing
+# ---------------------------------------------------------------------------
+@live_bp.post("/api/live/pause/<sid>")
+def api_live_pause(sid: str):
+    session = SESSION_MANAGER.get(sid)
+    if session is None:
+        return jsonify(error="Session not found."), 404
+    body = request.get_json(silent=True) or {}
+    paused = bool(body.get("paused", True))
+    session.pipeline.set_paused(paused)
+    log.info("Session %s %s", sid, "paused" if paused else "resumed")
+    return jsonify(session_id=sid, paused=paused)
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +356,8 @@ def api_live_session(sid: str):
         n_vehicles=len(p.vehicle_states),
         n_persons=len(p.person_states),
         n_plates=len(p.plate_states),
+        active_streams=session.active_streams,
+        paused=p.paused,
         elapsed_sec=round(time.time() - p.t_start, 1) if p.t_start else 0,
     )
 
@@ -334,28 +385,34 @@ def api_live_benchmark():
         "name": "benchmark_sample",
         "source": _BENCHMARK_SAMPLE_REL,
         "shape": list(bench_frame.shape),
-        "note": "pinned copy of C:\\Users\\harsh\\Downloads\\cctv samples\\1.mp4 frame 90",
+        "note": "pinned representative CCTV frame committed at static/benchmark_sample.jpg",
     })
 
-    # 1) YOLO detectors (COCO + plate variants)
+    # 1) YOLO detectors (COCO + plate variants).
+    # Measure exactly what the live pipeline would load for each name
+    # (engine._resolve_yolo_source prefers *_openvino_model/ dirs), but only
+    # include variants whose weights already exist locally so clicking
+    # "Run benchmark" never triggers a surprise Hugging Face download.
+    def _local_candidate(name: str) -> bool:
+        return (HERE / f"{name}.pt").exists() or (HERE / f"{name}_openvino_model").is_dir()
+
     yolo_candidates = []
     for name in ["yolo11n", "yolo11s", "yolo11m", "yolo11l"]:
-        p = HERE / f"{name}.pt"
-        if p.exists():
-            yolo_candidates.append(("coco", str(p), name))
+        if _local_candidate(name):
+            yolo_candidates.append(("coco", name))
     for name in ["yolo11_plate", "yolo11s_plate", "yolo11m_plate", "yolo11l_plate"]:
-        p = HERE / f"{name}.pt"
-        if p.exists():
-            yolo_candidates.append(("plate", str(p), name))
+        if _local_candidate(name):
+            yolo_candidates.append(("plate", name))
 
     if not yolo_candidates:
         out.append({"name": "yolo", "kind": "coco", "error": "No YOLO11 weights found in app/. Run install first."})
     else:
-        for kind, path, name in yolo_candidates:
+        for kind, name in yolo_candidates:
             try:
-                res = benchmark_model(path, frame=bench_frame)
+                src = engine._resolve_yolo_source(name)
+                res = benchmark_model(str(src), frame=bench_frame)
                 res["kind"] = kind
-                res["name"] = name
+                res["name"] = f"{name}" + ("/openvino" if str(src).endswith("_openvino_model") else "")
                 out.append(res)
             except Exception as e:
                 out.append({"name": name, "kind": kind, "error": str(e)})

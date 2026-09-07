@@ -1,0 +1,45 @@
+﻿formulate ANPR + FRS
+
+
+GOAL = make video analytics system for police
+
+
+1. ANPR - vehicle number plate recognition
+2. FRS - facial recognition system
+
+
+2 modes -
+1. Live - lightweight non-LLM approach
+2. Offline - heavy LLM based 
+
+
+Phase 1 - non-LLM ANPR system
+
+
+ANPR system stack - 
+1. Plate Detection - yolo 11 plate
+2. OCR - awiros anpr ocr
+3. Object Tracking - Bytetrack
+
+
+goal is to make below features:
+1. object identification - vehicle, person, etc
+2. object tracking
+3. vehicle number plate recognition and its OCR
+
+
+think what should be the best interface and implement it 
+the goal of the interface is that it should be verifiable so it should show all the steps done by the app - like object detection, plate extraction, ocr, tracking, etc - so everything should be clickable and verifiable
+
+
+later we plan to use this software on live streams so ensure that the processing speed is good enough for it, so compare the speeds of various yolo11 variants so we can decide better.
+sample videos given in “cctv samples” folder
+
+
+we will simulate live stream using these sample videos to see what the system shows in live - live annotations, cropping, OCR, etc - separate panel showing live results - clickable to see details
+
+
+Interface
+Select video file for live stream
+Each step of pipeline verifiable
+Configurable parameters - yolo11 version, yolo11 plate version, ocr strategy (best crop or every frame), best crop algo, etc
